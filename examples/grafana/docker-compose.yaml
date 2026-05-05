@@ -1,0 +1,16 @@
+services:
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: skaldberg-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./provisioning:/etc/grafana/provisioning
+    extra_hosts:
+      # Grafana runs in Docker; Skaldberg typically runs on the host
+      # (`cargo run --release -- --catalog memory ...`). This mapping
+      # lets the container reach `host.docker.internal:8080`.
+      - "host.docker.internal:host-gateway"
