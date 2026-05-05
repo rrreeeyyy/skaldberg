@@ -22,7 +22,7 @@ use datafusion::prelude::SessionContext;
 use iceberg_datafusion::IcebergCatalogProvider;
 use tracing::{info, warn};
 
-use crate::iceberg_table::{IcebergTables, NAMESPACE};
+use crate::iceberg_table::{CatalogConfig, IcebergTables, NAMESPACE};
 use crate::ingest::{IngestState, ValidatedSample, WalIter};
 
 /// Logical name DataFusion sees the catalog under.
@@ -36,9 +36,9 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub async fn open(wal_dir: &Path, warehouse_uri: &str) -> Result<Self> {
+    pub async fn open(wal_dir: &Path, catalog: &CatalogConfig) -> Result<Self> {
         // 1. Catalog + tables.
-        let tables = Arc::new(IcebergTables::open_memory(warehouse_uri).await?);
+        let tables = Arc::new(IcebergTables::open(catalog).await?);
 
         // 2. DataFusion session.
         let ctx = SessionContext::new();

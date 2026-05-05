@@ -1,7 +1,8 @@
-//! Skaldberg server (Phase 4).
+//! Skaldberg server.
 //!
-//! Cloud-native Iceberg-backed time-series database. Phase 4 runs against
-//! an in-process MemoryCatalog; Phase 5 swaps in `S3TablesCatalog`.
+//! Cloud-native Iceberg-backed time-series database. The catalog is
+//! selected at startup via `--catalog memory|s3tables`. `memory` is for
+//! local dev / tests; `s3tables` talks to AWS S3 Tables.
 
 mod convert;
 mod handlers;
@@ -15,50 +16,84 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use axum::routing::{get, post};
 use axum::Router;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use crate::iceberg_table::CatalogConfig;
 use crate::ingest::spawn_flusher;
 use crate::state::AppState;
 
 #[derive(Debug)]
 struct Args {
-    /// Filesystem path holding the WAL only. Iceberg data lives in the
-    /// in-memory warehouse for Phase 4; Phase 5 will replace this with an
-    /// S3 URI for the S3TablesCatalog warehouse.
     wal_dir: PathBuf,
-    warehouse_uri: String,
     bind: SocketAddr,
     flush_interval: Duration,
+    catalog: CatalogConfig,
+    /// If set, exported as `AWS_REGION` before the SDK initializes.
+    /// `AWS_REGION` / `AWS_DEFAULT_REGION` already in the environment take
+    /// precedence over CLI input only when this is `None`.
+    aws_region: Option<String>,
 }
 
 impl Args {
-    fn parse() -> Self {
-        let mut a = Args {
-            wal_dir: PathBuf::from("data/wal"),
-            warehouse_uri: "memory:///warehouse".to_string(),
-            bind: "127.0.0.1:8080".parse().unwrap(),
-            flush_interval: Duration::from_secs(300),
-        };
+    fn parse() -> Result<Self> {
+        let mut wal_dir = PathBuf::from("data/wal");
+        let mut bind: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mut flush_interval = Duration::from_secs(300);
+        let mut catalog_kind = String::from("memory");
+        let mut warehouse_uri = String::from("memory:///warehouse");
+        let mut table_bucket_arn: Option<String> = None;
+        let mut s3tables_endpoint: Option<String> = None;
+        let mut aws_region: Option<String> = None;
+
         let mut it = env::args().skip(1);
         while let Some(k) = it.next() {
             let v = it.next().unwrap_or_default();
             match k.as_str() {
-                "--wal-dir" => a.wal_dir = PathBuf::from(v),
-                "--warehouse-uri" => a.warehouse_uri = v,
-                "--bind" => a.bind = v.parse().expect("--bind addr:port"),
+                "--wal-dir" => wal_dir = PathBuf::from(v),
+                "--bind" => bind = v.parse().expect("--bind addr:port"),
                 "--flush-interval-secs" => {
                     let s: u64 = v.parse().expect("--flush-interval-secs <seconds>");
-                    a.flush_interval = Duration::from_secs(s);
+                    flush_interval = Duration::from_secs(s);
                 }
+                "--catalog" => catalog_kind = v,
+                "--warehouse-uri" => warehouse_uri = v,
+                "--table-bucket-arn" => table_bucket_arn = Some(v),
+                "--s3tables-endpoint" => s3tables_endpoint = Some(v),
+                "--aws-region" => aws_region = Some(v),
                 other => eprintln!("warn: unknown arg {}", other),
             }
         }
-        a
+
+        let catalog = match catalog_kind.as_str() {
+            "memory" => CatalogConfig::Memory { warehouse_uri },
+            "s3tables" => {
+                let arn = table_bucket_arn.ok_or_else(|| {
+                    anyhow!("--catalog s3tables requires --table-bucket-arn")
+                })?;
+                CatalogConfig::S3Tables {
+                    table_bucket_arn: arn,
+                    endpoint_url: s3tables_endpoint,
+                }
+            }
+            other => {
+                return Err(anyhow!(
+                    "--catalog must be 'memory' or 's3tables' (got {other})"
+                ));
+            }
+        };
+
+        Ok(Self {
+            wal_dir,
+            bind,
+            flush_interval,
+            catalog,
+            aws_region,
+        })
     }
 }
 
@@ -68,12 +103,19 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    let args = Args::parse();
+    let args = Args::parse()?;
+    if let Some(region) = &args.aws_region {
+        // Inject before any AWS SDK initialization. The default credential
+        // chain reads AWS_REGION / AWS_DEFAULT_REGION from the environment;
+        // pre-existing values take precedence because we only set when the
+        // caller explicitly passed --aws-region.
+        env::set_var("AWS_REGION", region);
+    }
     info!(?args, "starting skaldberg-server");
 
     std::fs::create_dir_all(&args.wal_dir)?;
 
-    let state = Arc::new(AppState::open(&args.wal_dir, &args.warehouse_uri).await?);
+    let state = Arc::new(AppState::open(&args.wal_dir, &args.catalog).await?);
     spawn_flusher(state.ingest.clone(), args.flush_interval);
 
     let app = Router::new()

@@ -1,9 +1,5 @@
 //! Iceberg catalog and table bootstrap.
 //!
-//! Phase 4 uses an in-process `MemoryCatalog` for the entire warehouse —
-//! no external services. Phase 5 will swap this for `S3TablesCatalog`
-//! against AWS without changing call sites.
-//!
 //! Two tables live under namespace `skaldberg`:
 //!
 //! - **series** — metadata catalog. One row per `(metric, labels)` pair.
@@ -14,6 +10,12 @@
 //!   Schema: `series_id BIGINT, timestamp TIMESTAMP, value DOUBLE`.
 //!   Partitioned by `days(timestamp)` so a `WHERE timestamp BETWEEN ...`
 //!   query reads only the relevant day files.
+//!
+//! `CatalogConfig` selects the backing catalog at startup. `Memory` is
+//! the dev / test path (in-process, no external services). `S3Tables`
+//! talks to AWS S3 Tables via `iceberg-catalog-s3tables`; AWS credentials
+//! and region are taken from the standard SDK chain (env vars / shared
+//! config / IAM role).
 //!
 //! Iceberg field IDs are stable across schema evolution. We assign them
 //! explicitly here and they're carried in Parquet metadata as
@@ -31,6 +33,9 @@ use iceberg::spec::{
     UnboundPartitionField,
 };
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+use iceberg_catalog_s3tables::{
+    S3TablesCatalogBuilder, S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN,
+};
 
 pub const NAMESPACE: &str = "skaldberg";
 pub const SERIES_TABLE: &str = "series";
@@ -49,6 +54,21 @@ pub mod field_ids {
     pub const VALUE: i32 = 3;
 }
 
+/// Catalog selection passed in from CLI / config.
+#[derive(Debug, Clone)]
+pub enum CatalogConfig {
+    /// In-process catalog backed by an in-memory warehouse URI.
+    /// Used for unit tests and local dev only.
+    Memory { warehouse_uri: String },
+    /// AWS S3 Tables catalog. Region and credentials come from the
+    /// standard AWS SDK chain (env vars / shared config / IAM role).
+    /// `endpoint_url` is optional and primarily for LocalStack-style testing.
+    S3Tables {
+        table_bucket_arn: String,
+        endpoint_url: Option<String>,
+    },
+}
+
 /// Holds shared state for catalog and the two table identifiers.
 pub struct IcebergTables {
     pub catalog: Arc<dyn Catalog>,
@@ -58,55 +78,97 @@ pub struct IcebergTables {
 }
 
 impl IcebergTables {
-    /// Build an in-process MemoryCatalog and ensure the namespace + both
-    /// tables exist. Idempotent: re-opening over an already-populated
-    /// catalog returns the existing tables (which is the no-op case
-    /// today since MemoryCatalog is in-process).
-    pub async fn open_memory(warehouse_uri: &str) -> Result<Self> {
-        let catalog = MemoryCatalogBuilder::default()
-            .with_storage_factory(Arc::new(MemoryStorageFactory))
-            .load(
-                "skaldberg",
-                HashMap::from([(
-                    MEMORY_CATALOG_WAREHOUSE.to_string(),
-                    warehouse_uri.to_string(),
-                )]),
-            )
-            .await
-            .context("memory catalog load")?;
-
-        let catalog: Arc<dyn Catalog> = Arc::new(catalog);
-        let namespace = NamespaceIdent::from_strs([NAMESPACE])?;
-        if catalog.get_namespace(&namespace).await.is_err() {
-            catalog
-                .create_namespace(&namespace, HashMap::new())
-                .await
-                .context("create namespace")?;
-        }
-
-        let series = TableIdent::new(namespace.clone(), SERIES_TABLE.to_string());
-        if catalog.load_table(&series).await.is_err() {
-            catalog
-                .create_table(&namespace, build_series_creation()?)
-                .await
-                .context("create series table")?;
-        }
-
-        let samples = TableIdent::new(namespace.clone(), SAMPLES_TABLE.to_string());
-        if catalog.load_table(&samples).await.is_err() {
-            catalog
-                .create_table(&namespace, build_samples_creation()?)
-                .await
-                .context("create samples table")?;
-        }
-
-        Ok(Self {
-            catalog,
-            namespace,
-            series,
-            samples,
-        })
+    /// Build the configured catalog and ensure the namespace + both
+    /// tables exist. Idempotent.
+    pub async fn open(config: &CatalogConfig) -> Result<Self> {
+        let catalog: Arc<dyn Catalog> = match config {
+            CatalogConfig::Memory { warehouse_uri } => {
+                Arc::new(build_memory_catalog(warehouse_uri).await?)
+            }
+            CatalogConfig::S3Tables {
+                table_bucket_arn,
+                endpoint_url,
+            } => Arc::new(
+                build_s3tables_catalog(table_bucket_arn, endpoint_url.as_deref()).await?,
+            ),
+        };
+        ensure_skaldberg_tables(catalog).await
     }
+
+    /// Convenience wrapper for tests and local-dev callers.
+    pub async fn open_memory(warehouse_uri: &str) -> Result<Self> {
+        Self::open(&CatalogConfig::Memory {
+            warehouse_uri: warehouse_uri.to_string(),
+        })
+        .await
+    }
+}
+
+async fn build_memory_catalog(warehouse_uri: &str) -> Result<impl Catalog> {
+    MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(MemoryStorageFactory))
+        .load(
+            "skaldberg",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                warehouse_uri.to_string(),
+            )]),
+        )
+        .await
+        .context("memory catalog load")
+}
+
+async fn build_s3tables_catalog(
+    table_bucket_arn: &str,
+    endpoint_url: Option<&str>,
+) -> Result<impl Catalog> {
+    let mut builder = S3TablesCatalogBuilder::default();
+    if let Some(url) = endpoint_url {
+        builder = builder.with_endpoint_url(url);
+    }
+    builder
+        .load(
+            "s3tables",
+            HashMap::from([(
+                S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
+                table_bucket_arn.to_string(),
+            )]),
+        )
+        .await
+        .context("s3tables catalog load")
+}
+
+async fn ensure_skaldberg_tables(catalog: Arc<dyn Catalog>) -> Result<IcebergTables> {
+    let namespace = NamespaceIdent::from_strs([NAMESPACE])?;
+    if catalog.get_namespace(&namespace).await.is_err() {
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .context("create namespace")?;
+    }
+
+    let series = TableIdent::new(namespace.clone(), SERIES_TABLE.to_string());
+    if catalog.load_table(&series).await.is_err() {
+        catalog
+            .create_table(&namespace, build_series_creation()?)
+            .await
+            .context("create series table")?;
+    }
+
+    let samples = TableIdent::new(namespace.clone(), SAMPLES_TABLE.to_string());
+    if catalog.load_table(&samples).await.is_err() {
+        catalog
+            .create_table(&namespace, build_samples_creation()?)
+            .await
+            .context("create samples table")?;
+    }
+
+    Ok(IcebergTables {
+        catalog,
+        namespace,
+        series,
+        samples,
+    })
 }
 
 pub fn series_iceberg_schema() -> Result<Schema> {
