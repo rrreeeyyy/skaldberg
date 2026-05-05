@@ -22,9 +22,10 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use metrics::{counter, histogram};
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
@@ -112,7 +113,21 @@ impl IngestState {
         };
 
         let max_seq = snap.max_record_seq;
-        let res = do_flush(&self.tables, snap).await.context("flush")?;
+        let started = Instant::now();
+        let res = do_flush(&self.tables, snap).await;
+        let elapsed = started.elapsed();
+        histogram!("skaldberg_flush_duration_seconds").record(elapsed.as_secs_f64());
+
+        let res = match res {
+            Ok(r) => {
+                counter!("skaldberg_flush_total", "result" => "ok").increment(1);
+                r
+            }
+            Err(e) => {
+                counter!("skaldberg_flush_total", "result" => "err").increment(1);
+                return Err(e).context("flush");
+            }
+        };
         info!(
             samples_files = res.samples_files,
             samples_rows = res.samples_rows,

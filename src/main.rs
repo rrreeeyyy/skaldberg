@@ -21,6 +21,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use axum::routing::{get, post};
 use axum::{middleware, Router};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -154,6 +155,14 @@ async fn main() -> Result<()> {
 
     std::fs::create_dir_all(&args.wal_dir)?;
 
+    // Install the global Prometheus recorder before anything that
+    // emits metrics runs (the flusher and the request handlers both
+    // call `metrics::counter!` / `histogram!`). Re-installing would
+    // panic, so we do this exactly once here.
+    let prom_handle = PrometheusBuilder::new()
+        .install_recorder()
+        .map_err(|e| anyhow!("install prometheus recorder: {e}"))?;
+
     let state = Arc::new(AppState::open(&args.wal_dir, &args.catalog).await?);
     spawn_flusher(state.ingest.clone(), args.flush_interval);
 
@@ -175,8 +184,20 @@ async fn main() -> Result<()> {
             api_token_state,
             auth::require_bearer_token,
         ));
+    // /metrics stays outside the auth layer — typical Prometheus
+    // scrape comes from a sidecar / kubelet that wouldn't carry the
+    // operator's bearer token. Operators who need to keep /metrics
+    // private should restrict access at the network layer.
+    let metrics_handler = {
+        let h = prom_handle.clone();
+        move || {
+            let h = h.clone();
+            async move { h.render() }
+        }
+    };
     let app = Router::new()
         .route("/healthz", get(handlers::healthz))
+        .route("/metrics", get(metrics_handler))
         .merge(api_v1)
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
