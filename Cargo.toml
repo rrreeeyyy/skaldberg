@@ -29,19 +29,19 @@ datafusion = "52.2"
 iceberg = "0.9"
 iceberg-catalog-s3tables = "0.9"
 iceberg-datafusion = "0.9"
-# Provides OpenDalStorageFactory. We instantiate it explicitly with
-# `configured_scheme = "s3"` because S3 Tables hands back metadata URLs
-# under the `s3://` scheme; the s3tables catalog's default factory
-# registers `s3a://` and would reject those URLs.
-iceberg-storage-opendal = "0.9"
 
-# OpenDAL's S3 driver (reqsign) doesn't share a credential chain with
-# the AWS SDK — it only reads env / IMDS / shared profile, missing SSO.
-# We resolve credentials once via the SDK and forward them to the
-# catalog as `s3.*` props so the SDK chain (env / SSO / profile /
-# IRSA / IMDS) is the source of truth.
+# We implement `iceberg::io::Storage` directly on top of aws-sdk-s3
+# instead of going through `iceberg-storage-opendal`. The OpenDAL path
+# uses `reqsign` for SigV4 signing, which has its own credential chain
+# distinct from the AWS SDK's — making SSO / shared-profile / IRSA
+# refresh awkward to plumb through. Going SDK-direct removes the
+# bridge and keeps a single, well-known credential code path.
 aws-config = "1"
-aws-credential-types = "1"
+aws-sdk-s3 = "1"
+# `Storage` / `StorageFactory` are tagged with `#[typetag::serde]`; we
+# need typetag visible to repeat that attribute on our impls.
+typetag = "0.2"
+bytes = "1"
 
 # Arrow / Parquet are re-exported from datafusion, but a few of our modules
 # (convert.rs, flush helpers) need the concrete types directly.

@@ -13,9 +13,10 @@
 //!
 //! `CatalogConfig` selects the backing catalog at startup. `Memory` is
 //! the dev / test path (in-process, no external services). `S3Tables`
-//! talks to AWS S3 Tables via `iceberg-catalog-s3tables`; AWS credentials
-//! and region are taken from the standard SDK chain (env vars / shared
-//! config / IAM role).
+//! talks to AWS S3 Tables via `iceberg-catalog-s3tables`, with our own
+//! aws-sdk-s3-backed `Storage` (see `aws_s3_storage`) so credentials
+//! flow through a single SDK code path (env / SSO / shared profile /
+//! IRSA / IMDS, all with built-in caching and refresh).
 //!
 //! Iceberg field IDs are stable across schema evolution. We assign them
 //! explicitly here and they're carried in Parquet metadata as
@@ -25,12 +26,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
-use aws_credential_types::provider::ProvideCredentials;
-use iceberg::io::{
-    MemoryStorageFactory, S3_ACCESS_KEY_ID, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
-};
+use iceberg::io::MemoryStorageFactory;
 use iceberg::memory::{MemoryCatalogBuilder, MEMORY_CATALOG_WAREHOUSE};
 use iceberg::spec::{
     MapType, NestedField, PartitionSpec, PrimitiveType, Schema, Transform, Type,
@@ -40,7 +38,8 @@ use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent
 use iceberg_catalog_s3tables::{
     S3TablesCatalogBuilder, S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN,
 };
-use iceberg_storage_opendal::OpenDalStorageFactory;
+
+use crate::aws_s3_storage::AwsSdkS3StorageFactory;
 
 pub const NAMESPACE: &str = "skaldberg";
 pub const SERIES_TABLE: &str = "series";
@@ -127,53 +126,25 @@ async fn build_s3tables_catalog(
     table_bucket_arn: &str,
     endpoint_url: Option<&str>,
 ) -> Result<impl Catalog> {
-    // S3 Tables returns metadata locations under the `s3://` scheme. The
-    // catalog's default storage factory registers `s3a://` instead, which
-    // would reject those URLs at file_io read/write time. Inject an
-    // OpenDalStorageFactory configured for the `s3` scheme explicitly.
-    let storage_factory = Arc::new(OpenDalStorageFactory::S3 {
-        configured_scheme: "s3".to_string(),
-        customized_credential_load: None,
-    });
+    // Resolve the SDK config once. The S3 client built per-Storage
+    // from this config carries the SDK's full credential chain and
+    // its own caching / refresh — we don't re-implement either.
+    let aws_cfg = aws_config::defaults(BehaviorVersion::latest()).load().await;
+    let storage_factory = Arc::new(AwsSdkS3StorageFactory::new(aws_cfg));
+
     let mut builder = S3TablesCatalogBuilder::default().with_storage_factory(storage_factory);
     if let Some(url) = endpoint_url {
         builder = builder.with_endpoint_url(url);
     }
 
-    // Resolve credentials via the AWS SDK chain (env / SSO / shared
-    // profile / IRSA / IMDS) and forward them to the catalog as `s3.*`
-    // props. OpenDAL's S3 driver doesn't share the SDK chain — without
-    // this bridge it falls through to its own credential resolution
-    // and only sees env / IMDS, missing SSO and shared-profile.
-    let aws_cfg = aws_config::defaults(BehaviorVersion::latest()).load().await;
-    let creds = aws_cfg
-        .credentials_provider()
-        .ok_or_else(|| anyhow!("AWS SDK could not resolve a credentials provider"))?
-        .provide_credentials()
-        .await
-        .context("resolve AWS credentials via SDK chain")?;
-
-    let mut props = HashMap::from([(
-        S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
-        table_bucket_arn.to_string(),
-    )]);
-    props.insert(
-        S3_ACCESS_KEY_ID.to_string(),
-        creds.access_key_id().to_string(),
-    );
-    props.insert(
-        S3_SECRET_ACCESS_KEY.to_string(),
-        creds.secret_access_key().to_string(),
-    );
-    if let Some(token) = creds.session_token() {
-        props.insert(S3_SESSION_TOKEN.to_string(), token.to_string());
-    }
-    if let Some(region) = aws_cfg.region() {
-        props.insert(S3_REGION.to_string(), region.to_string());
-    }
-
     builder
-        .load("s3tables", props)
+        .load(
+            "s3tables",
+            HashMap::from([(
+                S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
+                table_bucket_arn.to_string(),
+            )]),
+        )
         .await
         .context("s3tables catalog load")
 }
