@@ -25,8 +25,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use iceberg::io::MemoryStorageFactory;
+use anyhow::{anyhow, Context, Result};
+use aws_config::BehaviorVersion;
+use aws_credential_types::provider::ProvideCredentials;
+use iceberg::io::{
+    MemoryStorageFactory, S3_ACCESS_KEY_ID, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
+};
 use iceberg::memory::{MemoryCatalogBuilder, MEMORY_CATALOG_WAREHOUSE};
 use iceberg::spec::{
     MapType, NestedField, PartitionSpec, PrimitiveType, Schema, Transform, Type,
@@ -36,6 +40,7 @@ use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent
 use iceberg_catalog_s3tables::{
     S3TablesCatalogBuilder, S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN,
 };
+use iceberg_storage_opendal::OpenDalStorageFactory;
 
 pub const NAMESPACE: &str = "skaldberg";
 pub const SERIES_TABLE: &str = "series";
@@ -122,25 +127,69 @@ async fn build_s3tables_catalog(
     table_bucket_arn: &str,
     endpoint_url: Option<&str>,
 ) -> Result<impl Catalog> {
-    let mut builder = S3TablesCatalogBuilder::default();
+    // S3 Tables returns metadata locations under the `s3://` scheme. The
+    // catalog's default storage factory registers `s3a://` instead, which
+    // would reject those URLs at file_io read/write time. Inject an
+    // OpenDalStorageFactory configured for the `s3` scheme explicitly.
+    let storage_factory = Arc::new(OpenDalStorageFactory::S3 {
+        configured_scheme: "s3".to_string(),
+        customized_credential_load: None,
+    });
+    let mut builder = S3TablesCatalogBuilder::default().with_storage_factory(storage_factory);
     if let Some(url) = endpoint_url {
         builder = builder.with_endpoint_url(url);
     }
+
+    // Resolve credentials via the AWS SDK chain (env / SSO / shared
+    // profile / IRSA / IMDS) and forward them to the catalog as `s3.*`
+    // props. OpenDAL's S3 driver doesn't share the SDK chain — without
+    // this bridge it falls through to its own credential resolution
+    // and only sees env / IMDS, missing SSO and shared-profile.
+    let aws_cfg = aws_config::defaults(BehaviorVersion::latest()).load().await;
+    let creds = aws_cfg
+        .credentials_provider()
+        .ok_or_else(|| anyhow!("AWS SDK could not resolve a credentials provider"))?
+        .provide_credentials()
+        .await
+        .context("resolve AWS credentials via SDK chain")?;
+
+    let mut props = HashMap::from([(
+        S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
+        table_bucket_arn.to_string(),
+    )]);
+    props.insert(
+        S3_ACCESS_KEY_ID.to_string(),
+        creds.access_key_id().to_string(),
+    );
+    props.insert(
+        S3_SECRET_ACCESS_KEY.to_string(),
+        creds.secret_access_key().to_string(),
+    );
+    if let Some(token) = creds.session_token() {
+        props.insert(S3_SESSION_TOKEN.to_string(), token.to_string());
+    }
+    if let Some(region) = aws_cfg.region() {
+        props.insert(S3_REGION.to_string(), region.to_string());
+    }
+
     builder
-        .load(
-            "s3tables",
-            HashMap::from([(
-                S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
-                table_bucket_arn.to_string(),
-            )]),
-        )
+        .load("s3tables", props)
         .await
         .context("s3tables catalog load")
 }
 
 async fn ensure_skaldberg_tables(catalog: Arc<dyn Catalog>) -> Result<IcebergTables> {
+    // Use `*_exists` rather than catching `load_*` errors: with the
+    // S3Tables catalog, a load failure can mean "table does not exist"
+    // OR "table exists but its metadata location wasn't written" (an
+    // orphan from a half-failed earlier create). The latter must NOT
+    // trigger a re-create — that yields a 409 ConflictException.
     let namespace = NamespaceIdent::from_strs([NAMESPACE])?;
-    if catalog.get_namespace(&namespace).await.is_err() {
+    if !catalog
+        .namespace_exists(&namespace)
+        .await
+        .context("namespace_exists check")?
+    {
         catalog
             .create_namespace(&namespace, HashMap::new())
             .await
@@ -148,7 +197,11 @@ async fn ensure_skaldberg_tables(catalog: Arc<dyn Catalog>) -> Result<IcebergTab
     }
 
     let series = TableIdent::new(namespace.clone(), SERIES_TABLE.to_string());
-    if catalog.load_table(&series).await.is_err() {
+    if !catalog
+        .table_exists(&series)
+        .await
+        .context("table_exists series")?
+    {
         catalog
             .create_table(&namespace, build_series_creation()?)
             .await
@@ -156,7 +209,11 @@ async fn ensure_skaldberg_tables(catalog: Arc<dyn Catalog>) -> Result<IcebergTab
     }
 
     let samples = TableIdent::new(namespace.clone(), SAMPLES_TABLE.to_string());
-    if catalog.load_table(&samples).await.is_err() {
+    if !catalog
+        .table_exists(&samples)
+        .await
+        .context("table_exists samples")?
+    {
         catalog
             .create_table(&namespace, build_samples_creation()?)
             .await
