@@ -4,6 +4,7 @@
 //! selected at startup via `--catalog memory|s3tables`. `memory` is for
 //! local dev / tests; `s3tables` talks to AWS S3 Tables.
 
+mod aws_s3_storage;
 mod convert;
 mod handlers;
 mod iceberg_table;
