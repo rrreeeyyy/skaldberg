@@ -41,7 +41,8 @@ use axum::response::{IntoResponse, Response};
 use axum::{Form, Json};
 use chrono::{DateTime, Utc};
 use promql_parser::label::{MatchOp, Matcher};
-use promql_parser::parser::{parse, Expr, VectorSelector};
+use promql_parser::parser::token::{T_AVG, T_COUNT, T_MAX, T_MIN, T_SUM};
+use promql_parser::parser::{parse, Expr, LabelModifier, VectorSelector};
 use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
 
@@ -120,28 +121,62 @@ async fn instant_query_inner(
 
     let expr =
         parse(&p.query).map_err(|e| PromError::bad_data(format!("PromQL parse: {e}")))?;
-    let kind = match detect_query_kind(&expr) {
-        Some(k) => k,
-        None => return Ok(Json(success_vector(vec![]))),
-    };
+    let points = evaluate_instant(&state, &expr, time_us).await?;
+    Ok(Json(success_vector(instant_points_to_json(points))))
+}
 
-    let result = match kind {
-        QueryKind::Selector(sel) => instant_selector(&state, sel, time_us).await?,
-        QueryKind::Rate { sel, range_us } => {
-            instant_rate(&state, sel, range_us, time_us).await?
+/// Result of an instant query evaluation — one entry per output series.
+struct InstantPoint {
+    metric_name: String,
+    labels: BTreeMap<String, String>,
+    ts_us: i64,
+    value: f64,
+}
+
+/// Result of a range query evaluation — one entry per output series.
+struct RangePoints {
+    metric_name: String,
+    labels: BTreeMap<String, String>,
+    points: Vec<(i64, f64)>,
+}
+
+type InstantFut<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<InstantPoint>, PromError>> + Send + 'a>,
+>;
+type RangeFut<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<RangePoints>, PromError>> + Send + 'a>,
+>;
+
+/// Recursive evaluator for instant queries. `Box::pin` is what lets us
+/// recurse through `Aggregate { inner: ... }` into the nested
+/// expression (e.g. `sum(rate(metric[5m])) by (job)`).
+fn evaluate_instant<'a>(state: &'a AppState, expr: &'a Expr, time_us: i64) -> InstantFut<'a> {
+    Box::pin(async move {
+        match detect_query_kind(expr) {
+            Some(QueryKind::Selector(sel)) => instant_selector(state, sel, time_us).await,
+            Some(QueryKind::Rate { sel, range_us }) => {
+                instant_rate(state, sel, range_us, time_us).await
+            }
+            Some(QueryKind::Aggregate {
+                op,
+                modifier,
+                inner,
+            }) => {
+                let inner_pts = evaluate_instant(state, inner, time_us).await?;
+                Ok(aggregate_instant_points(inner_pts, op, modifier, time_us))
+            }
+            None => Ok(vec![]),
         }
-    };
-    Ok(Json(success_vector(result)))
+    })
 }
 
 async fn instant_selector(
     state: &AppState,
     sel: &VectorSelector,
     time_us: i64,
-) -> Result<Vec<JsonValue>, PromError> {
+) -> Result<Vec<InstantPoint>, PromError> {
     let from_us = time_us - LOOKBACK_US;
     let rows = run_selector_query(state, sel, from_us, time_us).await?;
-    // Latest sample per series within the lookback window.
     let mut latest: BTreeMap<String, SeriesRow> = BTreeMap::new();
     for r in rows {
         let key = series_key(&r.metric_name, &r.labels);
@@ -154,11 +189,11 @@ async fn instant_selector(
     }
     Ok(latest
         .into_values()
-        .map(|r| {
-            json!({
-                "metric": series_metric_obj(&r.metric_name, &r.labels),
-                "value": [(r.ts_us as f64) / 1_000_000.0, r.value.to_string()],
-            })
+        .map(|r| InstantPoint {
+            metric_name: r.metric_name,
+            labels: r.labels,
+            ts_us: r.ts_us,
+            value: r.value,
         })
         .collect())
 }
@@ -168,7 +203,7 @@ async fn instant_rate(
     sel: &VectorSelector,
     range_us: i64,
     time_us: i64,
-) -> Result<Vec<JsonValue>, PromError> {
+) -> Result<Vec<InstantPoint>, PromError> {
     let from_us = time_us - range_us;
     let rows = run_selector_query(state, sel, from_us, time_us).await?;
     let by_series = group_rows_by_series(rows);
@@ -176,13 +211,56 @@ async fn instant_rate(
     for (_, (metric_name, labels, mut points)) in by_series {
         points.sort_by_key(|(t, _)| *t);
         if let Some(rate) = compute_rate(&points) {
-            out.push(json!({
-                "metric": series_metric_obj(&metric_name, &labels),
-                "value": [(time_us as f64) / 1_000_000.0, rate.to_string()],
-            }));
+            out.push(InstantPoint {
+                metric_name,
+                labels,
+                ts_us: time_us,
+                value: rate,
+            });
         }
     }
     Ok(out)
+}
+
+/// Group instant points by retained labels, then collapse with `op`.
+/// Aggregations strip `__name__` (Prometheus convention).
+fn aggregate_instant_points(
+    inner: Vec<InstantPoint>,
+    op: AggOp,
+    modifier: Option<&LabelModifier>,
+    time_us: i64,
+) -> Vec<InstantPoint> {
+    let mut groups: BTreeMap<BTreeMap<String, String>, Vec<f64>> = BTreeMap::new();
+    for p in inner {
+        let key = retained_labels(&p.labels, modifier);
+        groups.entry(key).or_default().push(p.value);
+    }
+    groups
+        .into_iter()
+        .map(|(labels, values)| InstantPoint {
+            metric_name: String::new(),
+            labels,
+            ts_us: time_us,
+            value: apply_agg(op, &values),
+        })
+        .collect()
+}
+
+fn instant_points_to_json(points: Vec<InstantPoint>) -> Vec<JsonValue> {
+    points
+        .into_iter()
+        .map(|p| {
+            let metric = if p.metric_name.is_empty() {
+                metric_obj_no_name(&p.labels)
+            } else {
+                series_metric_obj(&p.metric_name, &p.labels)
+            };
+            json!({
+                "metric": metric,
+                "value": [(p.ts_us as f64) / 1_000_000.0, p.value.to_string()],
+            })
+        })
+        .collect()
 }
 
 // ---------- /api/v1/query_range (range) ----------
@@ -218,21 +296,43 @@ async fn range_query_inner(
     let start_us = parse_timestamp(&p.start)?;
     let end_us = parse_timestamp(&p.end)?;
     let step_us = parse_duration_us(&p.step)?;
+    if step_us <= 0 {
+        return Err(PromError::bad_data("step must be positive"));
+    }
 
     let expr =
         parse(&p.query).map_err(|e| PromError::bad_data(format!("PromQL parse: {e}")))?;
-    let kind = match detect_query_kind(&expr) {
-        Some(k) => k,
-        None => return Ok(Json(success_matrix(vec![]))),
-    };
+    let series = evaluate_range(&state, &expr, start_us, end_us, step_us).await?;
+    Ok(Json(success_matrix(range_points_to_json(series))))
+}
 
-    let result = match kind {
-        QueryKind::Selector(sel) => range_selector(&state, sel, start_us, end_us).await?,
-        QueryKind::Rate { sel, range_us } => {
-            range_rate(&state, sel, range_us, start_us, end_us, step_us).await?
+fn evaluate_range<'a>(
+    state: &'a AppState,
+    expr: &'a Expr,
+    start_us: i64,
+    end_us: i64,
+    step_us: i64,
+) -> RangeFut<'a> {
+    Box::pin(async move {
+        match detect_query_kind(expr) {
+            Some(QueryKind::Selector(sel)) => {
+                range_selector(state, sel, start_us, end_us).await
+            }
+            Some(QueryKind::Rate { sel, range_us }) => {
+                range_rate(state, sel, range_us, start_us, end_us, step_us).await
+            }
+            Some(QueryKind::Aggregate {
+                op,
+                modifier,
+                inner,
+            }) => {
+                let inner_series =
+                    evaluate_range(state, inner, start_us, end_us, step_us).await?;
+                Ok(aggregate_range_points(inner_series, op, modifier))
+            }
+            None => Ok(vec![]),
         }
-    };
-    Ok(Json(success_matrix(result)))
+    })
 }
 
 async fn range_selector(
@@ -240,26 +340,15 @@ async fn range_selector(
     sel: &VectorSelector,
     start_us: i64,
     end_us: i64,
-) -> Result<Vec<JsonValue>, PromError> {
+) -> Result<Vec<RangePoints>, PromError> {
     let rows = run_selector_query(state, sel, start_us, end_us).await?;
-    let mut groups: BTreeMap<String, (BTreeMap<String, String>, String, Vec<JsonValue>)> =
-        BTreeMap::new();
-    for r in rows {
-        let key = series_key(&r.metric_name, &r.labels);
-        let entry = groups
-            .entry(key)
-            .or_insert_with(|| (r.labels.clone(), r.metric_name.clone(), Vec::new()));
-        entry
-            .2
-            .push(json!([(r.ts_us as f64) / 1_000_000.0, r.value.to_string()]));
-    }
-    Ok(groups
+    let by_series = group_rows_by_series(rows);
+    Ok(by_series
         .into_values()
-        .map(|(labels, metric_name, values)| {
-            json!({
-                "metric": series_metric_obj(&metric_name, &labels),
-                "values": values,
-            })
+        .map(|(metric_name, labels, points)| RangePoints {
+            metric_name,
+            labels,
+            points,
         })
         .collect())
 }
@@ -271,10 +360,7 @@ async fn range_rate(
     start_us: i64,
     end_us: i64,
     step_us: i64,
-) -> Result<Vec<JsonValue>, PromError> {
-    if step_us <= 0 {
-        return Err(PromError::bad_data("step must be positive"));
-    }
+) -> Result<Vec<RangePoints>, PromError> {
     // Pull samples covering every step's lookback window in one go,
     // then bucket per-series and walk the steps in Rust.
     let fetch_from = start_us - range_us;
@@ -283,30 +369,89 @@ async fn range_rate(
     let mut out = Vec::new();
     for (_, (metric_name, labels, mut points)) in by_series {
         points.sort_by_key(|(t, _)| *t);
-        let mut values: Vec<JsonValue> = Vec::new();
+        let mut series_points: Vec<(i64, f64)> = Vec::new();
         let mut t = start_us;
         while t <= end_us {
             // Window is `(t - range, t]` per Prometheus convention.
-            // We bisect into the sorted points to avoid an O(N*M) scan
-            // on long ranges.
+            // partition_point keeps this O((N+M) log N) on long ranges.
             let lo_ts = t - range_us;
             let lo = points.partition_point(|(ts, _)| *ts < lo_ts);
             let hi = points.partition_point(|(ts, _)| *ts <= t);
             if hi.saturating_sub(lo) >= 2 {
                 if let Some(rate) = compute_rate(&points[lo..hi]) {
-                    values.push(json!([(t as f64) / 1_000_000.0, rate.to_string()]));
+                    series_points.push((t, rate));
                 }
             }
             t += step_us;
         }
-        if !values.is_empty() {
-            out.push(json!({
-                "metric": series_metric_obj(&metric_name, &labels),
-                "values": values,
-            }));
+        if !series_points.is_empty() {
+            out.push(RangePoints {
+                metric_name,
+                labels,
+                points: series_points,
+            });
         }
     }
     Ok(out)
+}
+
+/// Group input series by retained labels, align by timestamp, then
+/// collapse same-ts values with `op`. Aggregations strip `__name__`.
+fn aggregate_range_points(
+    inner: Vec<RangePoints>,
+    op: AggOp,
+    modifier: Option<&LabelModifier>,
+) -> Vec<RangePoints> {
+    let mut groups: BTreeMap<BTreeMap<String, String>, Vec<RangePoints>> = BTreeMap::new();
+    for p in inner {
+        let key = retained_labels(&p.labels, modifier);
+        groups.entry(key).or_default().push(p);
+    }
+    let mut out = Vec::new();
+    for (group_labels, members) in groups {
+        // Collect every timestamp seen across the group's series, then
+        // aggregate values that share the same timestamp.
+        let mut by_ts: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
+        for m in &members {
+            for (ts, v) in &m.points {
+                by_ts.entry(*ts).or_default().push(*v);
+            }
+        }
+        let series_points: Vec<(i64, f64)> = by_ts
+            .into_iter()
+            .map(|(ts, values)| (ts, apply_agg(op, &values)))
+            .collect();
+        if !series_points.is_empty() {
+            out.push(RangePoints {
+                metric_name: String::new(),
+                labels: group_labels,
+                points: series_points,
+            });
+        }
+    }
+    out
+}
+
+fn range_points_to_json(series: Vec<RangePoints>) -> Vec<JsonValue> {
+    series
+        .into_iter()
+        .map(|s| {
+            let metric = if s.metric_name.is_empty() {
+                metric_obj_no_name(&s.labels)
+            } else {
+                series_metric_obj(&s.metric_name, &s.labels)
+            };
+            let values: Vec<JsonValue> = s
+                .points
+                .into_iter()
+                .map(|(ts, v)| json!([(ts as f64) / 1_000_000.0, v.to_string()]))
+                .collect();
+            json!({
+                "metric": metric,
+                "values": values,
+            })
+        })
+        .collect()
 }
 
 /// Bucket selector-query rows into a per-series map. Key is the
@@ -555,24 +700,50 @@ struct SeriesRow {
     value: f64,
 }
 
-/// What we plan to do with the parsed PromQL expression. Step 2 only
-/// recognizes `rate(matrix)` natively; everything else falls through
-/// to the selector-unwrap path so panels still render *something*.
+/// What we plan to do with the parsed PromQL expression. Each
+/// step adds variants here; everything we don't recognize natively
+/// falls through to the selector-unwrap path so panels still render
+/// *something*.
 enum QueryKind<'a> {
     /// Return raw points for the wrapped vector selector.
     Selector(&'a VectorSelector),
     /// Compute Prometheus-style rate over the inner matrix selector.
-    /// `range_us` is the matrix's range duration.
     Rate {
         sel: &'a VectorSelector,
         range_us: i64,
     },
+    /// Aggregate the inner expression's results, optionally grouped
+    /// by/without a label set.
+    Aggregate {
+        op: AggOp,
+        modifier: Option<&'a LabelModifier>,
+        inner: &'a Expr,
+    },
 }
 
-/// Pick a query plan for the AST. Step 2 only adds `rate`; new
-/// recognizers (sum / histogram_quantile / topk / ...) drop into
-/// this `match` over time.
+#[derive(Clone, Copy)]
+enum AggOp {
+    Sum,
+    Avg,
+    Min,
+    Max,
+    Count,
+}
+
+/// Pick a query plan for the AST. New recognizers drop into this
+/// `match` as we add native semantics for more PromQL features.
 fn detect_query_kind(expr: &Expr) -> Option<QueryKind<'_>> {
+    if let Expr::Aggregate(a) = expr {
+        if let Some(op) = parse_agg_op(a.op.id()) {
+            return Some(QueryKind::Aggregate {
+                op,
+                modifier: a.modifier.as_ref(),
+                inner: a.expr.as_ref(),
+            });
+        }
+        // Unknown aggregation op (topk / quantile / stddev / ...) — fall
+        // through to selector unwrap so the panel still draws something.
+    }
     if let Expr::Call(c) = expr {
         if c.func.name.eq_ignore_ascii_case("rate") {
             if let Some(arg) = c.args.args.first() {
@@ -586,6 +757,61 @@ fn detect_query_kind(expr: &Expr) -> Option<QueryKind<'_>> {
         }
     }
     extract_selector(expr).map(QueryKind::Selector)
+}
+
+fn parse_agg_op(id: u8) -> Option<AggOp> {
+    match id {
+        x if x == T_SUM => Some(AggOp::Sum),
+        x if x == T_AVG => Some(AggOp::Avg),
+        x if x == T_MIN => Some(AggOp::Min),
+        x if x == T_MAX => Some(AggOp::Max),
+        x if x == T_COUNT => Some(AggOp::Count),
+        _ => None,
+    }
+}
+
+fn apply_agg(op: AggOp, values: &[f64]) -> f64 {
+    match op {
+        AggOp::Sum => values.iter().copied().sum(),
+        AggOp::Avg => {
+            if values.is_empty() {
+                0.0
+            } else {
+                values.iter().copied().sum::<f64>() / values.len() as f64
+            }
+        }
+        AggOp::Min => values.iter().copied().fold(f64::INFINITY, f64::min),
+        AggOp::Max => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        AggOp::Count => values.len() as f64,
+    }
+}
+
+/// Reduce a series's labels to the group key implied by a `by(...)` /
+/// `without(...)` modifier. No modifier means everything aggregates
+/// into a single, label-less group (Prometheus default).
+fn retained_labels(
+    labels: &BTreeMap<String, String>,
+    modifier: Option<&LabelModifier>,
+) -> BTreeMap<String, String> {
+    match modifier {
+        Some(LabelModifier::Include(ls)) => {
+            let keep: BTreeSet<&str> = ls.labels.iter().map(String::as_str).collect();
+            labels
+                .iter()
+                .filter(|(k, _)| keep.contains(k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        }
+        Some(LabelModifier::Exclude(ls)) => {
+            let drop: BTreeSet<&str> = ls.labels.iter().map(String::as_str).collect();
+            labels
+                .iter()
+                .filter(|(k, _)| !drop.contains(k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        }
+        None => BTreeMap::new(),
+    }
 }
 
 /// Walk an Expr down to the first vector/matrix selector found.
@@ -866,6 +1092,16 @@ fn series_metric_obj(metric_name: &str, labels: &BTreeMap<String, String>) -> Js
         "__name__".to_string(),
         JsonValue::String(metric_name.to_string()),
     );
+    for (k, v) in labels {
+        m.insert(k.clone(), JsonValue::String(v.clone()));
+    }
+    JsonValue::Object(m)
+}
+
+/// Same as `series_metric_obj` but without `__name__` — used for
+/// aggregation results, which Prometheus convention strips of name.
+fn metric_obj_no_name(labels: &BTreeMap<String, String>) -> JsonValue {
+    let mut m = serde_json::Map::new();
     for (k, v) in labels {
         m.insert(k.clone(), JsonValue::String(v.clone()));
     }
