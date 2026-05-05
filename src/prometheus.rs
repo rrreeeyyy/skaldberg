@@ -120,14 +120,27 @@ async fn instant_query_inner(
 
     let expr =
         parse(&p.query).map_err(|e| PromError::bad_data(format!("PromQL parse: {e}")))?;
-    let sel = match extract_selector(&expr) {
-        Some(s) => s,
+    let kind = match detect_query_kind(&expr) {
+        Some(k) => k,
         None => return Ok(Json(success_vector(vec![]))),
     };
 
-    let from_us = time_us - LOOKBACK_US;
-    let rows = run_selector_query(&state, sel, from_us, time_us).await?;
+    let result = match kind {
+        QueryKind::Selector(sel) => instant_selector(&state, sel, time_us).await?,
+        QueryKind::Rate { sel, range_us } => {
+            instant_rate(&state, sel, range_us, time_us).await?
+        }
+    };
+    Ok(Json(success_vector(result)))
+}
 
+async fn instant_selector(
+    state: &AppState,
+    sel: &VectorSelector,
+    time_us: i64,
+) -> Result<Vec<JsonValue>, PromError> {
+    let from_us = time_us - LOOKBACK_US;
+    let rows = run_selector_query(state, sel, from_us, time_us).await?;
     // Latest sample per series within the lookback window.
     let mut latest: BTreeMap<String, SeriesRow> = BTreeMap::new();
     for r in rows {
@@ -139,7 +152,7 @@ async fn instant_query_inner(
             }
         }
     }
-    let result: Vec<JsonValue> = latest
+    Ok(latest
         .into_values()
         .map(|r| {
             json!({
@@ -147,8 +160,29 @@ async fn instant_query_inner(
                 "value": [(r.ts_us as f64) / 1_000_000.0, r.value.to_string()],
             })
         })
-        .collect();
-    Ok(Json(success_vector(result)))
+        .collect())
+}
+
+async fn instant_rate(
+    state: &AppState,
+    sel: &VectorSelector,
+    range_us: i64,
+    time_us: i64,
+) -> Result<Vec<JsonValue>, PromError> {
+    let from_us = time_us - range_us;
+    let rows = run_selector_query(state, sel, from_us, time_us).await?;
+    let by_series = group_rows_by_series(rows);
+    let mut out = Vec::new();
+    for (_, (metric_name, labels, mut points)) in by_series {
+        points.sort_by_key(|(t, _)| *t);
+        if let Some(rate) = compute_rate(&points) {
+            out.push(json!({
+                "metric": series_metric_obj(&metric_name, &labels),
+                "value": [(time_us as f64) / 1_000_000.0, rate.to_string()],
+            }));
+        }
+    }
+    Ok(out)
 }
 
 // ---------- /api/v1/query_range (range) ----------
@@ -183,16 +217,31 @@ async fn range_query_inner(
 ) -> Result<Json<JsonValue>, PromError> {
     let start_us = parse_timestamp(&p.start)?;
     let end_us = parse_timestamp(&p.end)?;
-    let _ = parse_duration_us(&p.step)?; // validate
+    let step_us = parse_duration_us(&p.step)?;
 
     let expr =
         parse(&p.query).map_err(|e| PromError::bad_data(format!("PromQL parse: {e}")))?;
-    let sel = match extract_selector(&expr) {
-        Some(s) => s,
+    let kind = match detect_query_kind(&expr) {
+        Some(k) => k,
         None => return Ok(Json(success_matrix(vec![]))),
     };
 
-    let rows = run_selector_query(&state, sel, start_us, end_us).await?;
+    let result = match kind {
+        QueryKind::Selector(sel) => range_selector(&state, sel, start_us, end_us).await?,
+        QueryKind::Rate { sel, range_us } => {
+            range_rate(&state, sel, range_us, start_us, end_us, step_us).await?
+        }
+    };
+    Ok(Json(success_matrix(result)))
+}
+
+async fn range_selector(
+    state: &AppState,
+    sel: &VectorSelector,
+    start_us: i64,
+    end_us: i64,
+) -> Result<Vec<JsonValue>, PromError> {
+    let rows = run_selector_query(state, sel, start_us, end_us).await?;
     let mut groups: BTreeMap<String, (BTreeMap<String, String>, String, Vec<JsonValue>)> =
         BTreeMap::new();
     for r in rows {
@@ -204,7 +253,7 @@ async fn range_query_inner(
             .2
             .push(json!([(r.ts_us as f64) / 1_000_000.0, r.value.to_string()]));
     }
-    let result: Vec<JsonValue> = groups
+    Ok(groups
         .into_values()
         .map(|(labels, metric_name, values)| {
             json!({
@@ -212,8 +261,104 @@ async fn range_query_inner(
                 "values": values,
             })
         })
-        .collect();
-    Ok(Json(success_matrix(result)))
+        .collect())
+}
+
+async fn range_rate(
+    state: &AppState,
+    sel: &VectorSelector,
+    range_us: i64,
+    start_us: i64,
+    end_us: i64,
+    step_us: i64,
+) -> Result<Vec<JsonValue>, PromError> {
+    if step_us <= 0 {
+        return Err(PromError::bad_data("step must be positive"));
+    }
+    // Pull samples covering every step's lookback window in one go,
+    // then bucket per-series and walk the steps in Rust.
+    let fetch_from = start_us - range_us;
+    let rows = run_selector_query(state, sel, fetch_from, end_us).await?;
+    let by_series = group_rows_by_series(rows);
+    let mut out = Vec::new();
+    for (_, (metric_name, labels, mut points)) in by_series {
+        points.sort_by_key(|(t, _)| *t);
+        let mut values: Vec<JsonValue> = Vec::new();
+        let mut t = start_us;
+        while t <= end_us {
+            // Window is `(t - range, t]` per Prometheus convention.
+            // We bisect into the sorted points to avoid an O(N*M) scan
+            // on long ranges.
+            let lo_ts = t - range_us;
+            let lo = points.partition_point(|(ts, _)| *ts < lo_ts);
+            let hi = points.partition_point(|(ts, _)| *ts <= t);
+            if hi.saturating_sub(lo) >= 2 {
+                if let Some(rate) = compute_rate(&points[lo..hi]) {
+                    values.push(json!([(t as f64) / 1_000_000.0, rate.to_string()]));
+                }
+            }
+            t += step_us;
+        }
+        if !values.is_empty() {
+            out.push(json!({
+                "metric": series_metric_obj(&metric_name, &labels),
+                "values": values,
+            }));
+        }
+    }
+    Ok(out)
+}
+
+/// Bucket selector-query rows into a per-series map. Key is the
+/// stable `metric{label=...}` string so series stay sorted in output.
+fn group_rows_by_series(
+    rows: Vec<SeriesRow>,
+) -> BTreeMap<String, (String, BTreeMap<String, String>, Vec<(i64, f64)>)> {
+    let mut by_series: BTreeMap<String, (String, BTreeMap<String, String>, Vec<(i64, f64)>)> =
+        BTreeMap::new();
+    for r in rows {
+        let key = series_key(&r.metric_name, &r.labels);
+        let entry = by_series
+            .entry(key)
+            .or_insert_with(|| (r.metric_name.clone(), r.labels.clone(), Vec::new()));
+        entry.2.push((r.ts_us, r.value));
+    }
+    by_series
+}
+
+/// PromQL-style `rate` over an ascending-sorted slice of (ts_us, value).
+///
+/// Returns `delta / seconds`, where `delta` accounts for counter
+/// resets in the same way Prometheus's `delta`/`rate` do *internally*
+/// — at every drop (`curr < prev`) we treat `curr` as a fresh value
+/// counted from zero, instead of letting a reset register as a huge
+/// negative spike. We do **not** apply Prometheus's extrapolation
+/// to the range edges, so on short windows numbers will differ
+/// slightly from a real Prometheus server. Panel rendering and
+/// magnitude are correct.
+fn compute_rate(points: &[(i64, f64)]) -> Option<f64> {
+    if points.len() < 2 {
+        return None;
+    }
+    let first_ts = points.first()?.0;
+    let last_ts = points.last()?.0;
+    let secs = (last_ts - first_ts) as f64 / 1_000_000.0;
+    if secs <= 0.0 {
+        return None;
+    }
+    let mut delta = 0.0_f64;
+    for w in points.windows(2) {
+        let prev = w[0].1;
+        let curr = w[1].1;
+        if curr >= prev {
+            delta += curr - prev;
+        } else {
+            // Counter reset: assume the underlying counter went 0 →
+            // curr in the gap. Equivalent to `curr - 0`.
+            delta += curr;
+        }
+    }
+    Some(delta / secs)
 }
 
 // ---------- /api/v1/labels ----------
@@ -408,6 +553,39 @@ struct SeriesRow {
     labels: BTreeMap<String, String>,
     ts_us: i64,
     value: f64,
+}
+
+/// What we plan to do with the parsed PromQL expression. Step 2 only
+/// recognizes `rate(matrix)` natively; everything else falls through
+/// to the selector-unwrap path so panels still render *something*.
+enum QueryKind<'a> {
+    /// Return raw points for the wrapped vector selector.
+    Selector(&'a VectorSelector),
+    /// Compute Prometheus-style rate over the inner matrix selector.
+    /// `range_us` is the matrix's range duration.
+    Rate {
+        sel: &'a VectorSelector,
+        range_us: i64,
+    },
+}
+
+/// Pick a query plan for the AST. Step 2 only adds `rate`; new
+/// recognizers (sum / histogram_quantile / topk / ...) drop into
+/// this `match` over time.
+fn detect_query_kind(expr: &Expr) -> Option<QueryKind<'_>> {
+    if let Expr::Call(c) = expr {
+        if c.func.name.eq_ignore_ascii_case("rate") {
+            if let Some(arg) = c.args.args.first() {
+                if let Expr::MatrixSelector(m) = arg.as_ref() {
+                    return Some(QueryKind::Rate {
+                        sel: &m.vs,
+                        range_us: m.range.as_micros() as i64,
+                    });
+                }
+            }
+        }
+    }
+    extract_selector(expr).map(QueryKind::Selector)
 }
 
 /// Walk an Expr down to the first vector/matrix selector found.
