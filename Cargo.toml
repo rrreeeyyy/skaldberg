@@ -27,6 +27,7 @@ serde_json = "1"
 # transparently. iceberg-datafusion 0.9 pins datafusion ^52.2.
 datafusion = "52.2"
 iceberg = "0.9"
+iceberg-catalog-s3tables = "0.9"
 iceberg-datafusion = "0.9"
 
 # Arrow / Parquet are re-exported from datafusion, but a few of our modules
