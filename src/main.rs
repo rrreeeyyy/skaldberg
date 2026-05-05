@@ -4,6 +4,7 @@
 //! selected at startup via `--catalog memory|s3tables`. `memory` is for
 //! local dev / tests; `s3tables` talks to AWS S3 Tables.
 
+mod auth;
 mod aws_s3_storage;
 mod convert;
 mod handlers;
@@ -19,14 +20,26 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{middleware, Router};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use crate::auth::ApiTokenState;
 use crate::iceberg_table::CatalogConfig;
 use crate::ingest::spawn_flusher;
 use crate::state::AppState;
+
+/// CLI / env-supplied auth token. Wrapped to keep the token out of
+/// `Args`'s Debug output (Args is logged at startup).
+#[derive(Clone)]
+struct ApiToken(String);
+
+impl std::fmt::Debug for ApiToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
 
 #[derive(Debug)]
 struct Args {
@@ -43,6 +56,9 @@ struct Args {
     /// `AWS_REGION` / `AWS_DEFAULT_REGION` already in the environment take
     /// precedence over CLI input only when this is `None`.
     aws_region: Option<String>,
+    /// When `Some`, /api/v1/* requires `Authorization: Bearer <T>`.
+    /// When `None`, auth is disabled.
+    api_token: Option<ApiToken>,
 }
 
 impl Args {
@@ -56,6 +72,7 @@ impl Args {
         let mut table_bucket_arn: Option<String> = None;
         let mut s3tables_endpoint: Option<String> = None;
         let mut aws_region: Option<String> = None;
+        let mut api_token_arg: Option<String> = None;
 
         let mut it = env::args().skip(1);
         while let Some(k) = it.next() {
@@ -76,6 +93,7 @@ impl Args {
                 "--table-bucket-arn" => table_bucket_arn = Some(v),
                 "--s3tables-endpoint" => s3tables_endpoint = Some(v),
                 "--aws-region" => aws_region = Some(v),
+                "--api-token" => api_token_arg = Some(v),
                 other => eprintln!("warn: unknown arg {}", other),
             }
         }
@@ -98,6 +116,14 @@ impl Args {
             }
         };
 
+        // CLI flag wins; otherwise fall back to the env var. Empty
+        // strings are treated as unset to avoid confusing
+        // `SKALDBERG_API_TOKEN=` (export with no value) with auth on.
+        let api_token = api_token_arg
+            .or_else(|| env::var("SKALDBERG_API_TOKEN").ok())
+            .filter(|s| !s.is_empty())
+            .map(ApiToken);
+
         Ok(Self {
             wal_dir,
             bind,
@@ -105,6 +131,7 @@ impl Args {
             shutdown_timeout,
             catalog,
             aws_region,
+            api_token,
         })
     }
 }
@@ -130,11 +157,27 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState::open(&args.wal_dir, &args.catalog).await?);
     spawn_flusher(state.ingest.clone(), args.flush_interval);
 
-    let app = Router::new()
-        .route("/healthz", get(handlers::healthz))
+    // /api/v1/* is bearer-auth gated when --api-token / SKALDBERG_API_TOKEN
+    // is set. /healthz stays public so external probes don't need the
+    // token.
+    let api_token_state: ApiTokenState =
+        Arc::new(args.api_token.as_ref().map(|t| t.0.clone()));
+    if api_token_state.is_some() {
+        info!("API auth enabled (bearer token required for /api/v1/*)");
+    } else {
+        info!("API auth disabled (no token configured)");
+    }
+    let api_v1 = Router::new()
         .route("/api/v1/sql", post(handlers::run_sql))
         .route("/api/v1/ingest", post(handlers::run_ingest))
         .route("/api/v1/write", post(handlers::run_remote_write))
+        .layer(middleware::from_fn_with_state(
+            api_token_state,
+            auth::require_bearer_token,
+        ));
+    let app = Router::new()
+        .route("/healthz", get(handlers::healthz))
+        .merge(api_v1)
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
