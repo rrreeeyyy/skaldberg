@@ -15,6 +15,7 @@ correctly across a restart, not that data persists.
 """
 import json
 import os
+import pathlib
 import shutil
 import signal
 import subprocess
@@ -24,7 +25,12 @@ import time
 import urllib.error
 import urllib.request
 
-SERVER_BIN = "/home/claude/skaldberg-server/target/debug/skaldberg-server"
+# Resolve to `<repo>/target/debug/skaldberg-server` by default. Override
+# with `SKALDBERG_BIN=...` (e.g. for release builds or CI artifacts).
+SERVER_BIN = os.environ.get(
+    "SKALDBERG_BIN",
+    str(pathlib.Path(__file__).resolve().parent.parent / "target" / "debug" / "skaldberg-server"),
+)
 
 
 def start_server(wal_dir, port, flush_secs=2):
