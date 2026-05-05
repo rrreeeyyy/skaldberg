@@ -33,6 +33,11 @@ struct Args {
     wal_dir: PathBuf,
     bind: SocketAddr,
     flush_interval: Duration,
+    /// Hard deadline for draining in-flight HTTP requests after a
+    /// shutdown signal. When this elapses we stop waiting and run
+    /// the final flush anyway — losing the in-flight sample beats
+    /// hanging past the orchestrator's SIGKILL window.
+    shutdown_timeout: Duration,
     catalog: CatalogConfig,
     /// If set, exported as `AWS_REGION` before the SDK initializes.
     /// `AWS_REGION` / `AWS_DEFAULT_REGION` already in the environment take
@@ -45,6 +50,7 @@ impl Args {
         let mut wal_dir = PathBuf::from("data/wal");
         let mut bind: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let mut flush_interval = Duration::from_secs(300);
+        let mut shutdown_timeout = Duration::from_secs(30);
         let mut catalog_kind = String::from("memory");
         let mut warehouse_uri = String::from("memory:///warehouse");
         let mut table_bucket_arn: Option<String> = None;
@@ -60,6 +66,10 @@ impl Args {
                 "--flush-interval-secs" => {
                     let s: u64 = v.parse().expect("--flush-interval-secs <seconds>");
                     flush_interval = Duration::from_secs(s);
+                }
+                "--shutdown-timeout-secs" => {
+                    let s: u64 = v.parse().expect("--shutdown-timeout-secs <seconds>");
+                    shutdown_timeout = Duration::from_secs(s);
                 }
                 "--catalog" => catalog_kind = v,
                 "--warehouse-uri" => warehouse_uri = v,
@@ -92,6 +102,7 @@ impl Args {
             wal_dir,
             bind,
             flush_interval,
+            shutdown_timeout,
             catalog,
             aws_region,
         })
@@ -130,35 +141,58 @@ async fn main() -> Result<()> {
     info!(bind = %args.bind, "listening");
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
 
-    // Graceful shutdown: on SIGTERM / Ctrl-C, stop accepting new requests
-    // and run one final flush so the WAL replay on the next start has the
-    // smallest possible work to do.
-    let shutdown_state = state.clone();
-    let server_fut = axum::serve(listener, app).with_graceful_shutdown(async move {
-        let ctrl_c = async {
-            tokio::signal::ctrl_c().await.ok();
-        };
-        #[cfg(unix)]
-        let term = async {
-            use tokio::signal::unix::{signal, SignalKind};
-            if let Ok(mut s) = signal(SignalKind::terminate()) {
-                s.recv().await;
-            }
-        };
-        #[cfg(not(unix))]
-        let term = std::future::pending::<()>();
+    // Graceful shutdown:
+    //
+    //   1. Wait for SIGTERM / Ctrl-C.
+    //   2. Tell axum to stop accepting new connections and let the
+    //      in-flight requests drain (bounded by `shutdown_timeout`).
+    //      We deliberately do NOT flush here — flushing while ingest
+    //      requests are still landing would race with the buffer.
+    //   3. Once the listener is fully drained (or we time out
+    //      waiting), run a final flush so the WAL replay on the next
+    //      start has the smallest possible work to do.
+    //
+    // If the in-flight drain doesn't finish inside `shutdown_timeout`
+    // we move on anyway — the orchestrator's SIGKILL window is the
+    // real wall, and a partial-but-flushed buffer is better than an
+    // intact-but-never-committed one.
+    let server_fut = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
 
-        tokio::select! {
-            _ = ctrl_c => info!("ctrl-c received"),
-            _ = term => info!("SIGTERM received"),
-        }
-        info!("running final flush before shutdown");
-        if let Err(e) = shutdown_state.ingest.flush_once().await {
-            tracing::error!(error = format!("{:#}", e), "final flush failed");
-        }
-    });
+    match tokio::time::timeout(args.shutdown_timeout, server_fut).await {
+        Ok(Ok(())) => info!("listener drained"),
+        Ok(Err(e)) => tracing::error!(error = %e, "server returned error during shutdown"),
+        Err(_) => tracing::warn!(
+            timeout_secs = args.shutdown_timeout.as_secs(),
+            "listener did not drain in time, proceeding to final flush",
+        ),
+    }
 
-    server_fut.await?;
+    info!("running final flush before exit");
+    if let Err(e) = state.ingest.flush_once().await {
+        tracing::error!(error = format!("{:#}", e), "final flush failed");
+    }
     info!("server shut down cleanly");
     Ok(())
+}
+
+/// Resolves on the first SIGTERM (Unix) or Ctrl-C; never resolves on
+/// platforms without SIGTERM (the Ctrl-C arm still works).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.ok();
+    };
+    #[cfg(unix)]
+    let term = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut s) = signal(SignalKind::terminate()) {
+            s.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("ctrl-c received"),
+        _ = term => info!("SIGTERM received"),
+    }
 }
