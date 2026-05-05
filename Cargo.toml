@@ -71,6 +71,16 @@ futures = "0.3"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
+# Prometheus HTTP API adapter: parse PromQL into an AST and translate
+# the supported subset (selectors + range vectors + offset; functions
+# and aggregations are unwrapped to their inner selector for now)
+# into Skaldberg SQL.
+promql-parser = "0.8"
+# Hand-roll the `match[]=...&match[]=...` query string for /api/v1/series
+# (axum's Query extractor uses serde_urlencoded which doesn't
+# collapse repeated keys into a Vec).
+url = "2"
+
 # Errors / time
 anyhow = "1"
 thiserror = "1"

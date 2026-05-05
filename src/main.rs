@@ -10,6 +10,7 @@ mod convert;
 mod handlers;
 mod iceberg_table;
 mod ingest;
+mod prometheus;
 mod state;
 
 use std::env;
@@ -180,6 +181,21 @@ async fn main() -> Result<()> {
         .route("/api/v1/sql", post(handlers::run_sql))
         .route("/api/v1/ingest", post(handlers::run_ingest))
         .route("/api/v1/write", post(handlers::run_remote_write))
+        // Prometheus HTTP API subset for Grafana's built-in
+        // Prometheus datasource. Step 1 covers selectors + the
+        // discovery endpoints; functions / aggregations are parsed
+        // but unwrapped to the inner selector.
+        .route(
+            "/api/v1/query",
+            get(prometheus::query).post(prometheus::query_post),
+        )
+        .route(
+            "/api/v1/query_range",
+            get(prometheus::query_range).post(prometheus::query_range_post),
+        )
+        .route("/api/v1/labels", get(prometheus::labels))
+        .route("/api/v1/label/:name/values", get(prometheus::label_values))
+        .route("/api/v1/series", get(prometheus::series))
         .layer(middleware::from_fn_with_state(
             api_token_state,
             auth::require_bearer_token,
