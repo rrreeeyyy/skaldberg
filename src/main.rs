@@ -7,6 +7,7 @@
 mod auth;
 mod aws_s3_storage;
 mod convert;
+mod grafana;
 mod handlers;
 mod iceberg_table;
 mod ingest;
@@ -180,6 +181,12 @@ async fn main() -> Result<()> {
         .route("/api/v1/sql", post(handlers::run_sql))
         .route("/api/v1/ingest", post(handlers::run_ingest))
         .route("/api/v1/write", post(handlers::run_remote_write))
+        // Grafana JSON Datasource adapter (SimPod plugin contract).
+        // Stays under /api/v1/* so the bearer-token middleware
+        // protects it on the same terms as the rest of the API.
+        .route("/api/v1/grafana/", post(grafana::root))
+        .route("/api/v1/grafana/search", post(grafana::search))
+        .route("/api/v1/grafana/query", post(grafana::query))
         .layer(middleware::from_fn_with_state(
             api_token_state,
             auth::require_bearer_token,

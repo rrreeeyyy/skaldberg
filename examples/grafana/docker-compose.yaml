@@ -1,0 +1,19 @@
+services:
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: skaldberg-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Auto-install the SimPod JSON Datasource plugin so the
+      # provisioned datasource below resolves on first boot.
+      GF_INSTALL_PLUGINS: "simpod-json-datasource"
+    volumes:
+      - ./provisioning:/etc/grafana/provisioning
+    extra_hosts:
+      # Allow the container to reach a Skaldberg server running on
+      # the host (the typical local-dev setup: `cargo run --release
+      # -- --catalog memory ...` on the host, Grafana in Docker).
+      - "host.docker.internal:host-gateway"

@@ -1,0 +1,20 @@
+apiVersion: 1
+
+datasources:
+  - name: Skaldberg
+    type: simpod-json-datasource
+    access: proxy
+    # Skaldberg listens on the host by default. Override URL with
+    # `GF_DATASOURCES_SKALDBERG_URL=...` (Grafana env-var override
+    # syntax) if you're running it elsewhere.
+    url: http://host.docker.internal:8080/api/v1/grafana
+    isDefault: true
+    editable: true
+    jsonData:
+      httpMethod: POST
+      # If you've set `--api-token / SKALDBERG_API_TOKEN` on the
+      # server, drop the value into `secureJsonData.httpHeaderValue1`
+      # here (or via the UI after first boot).
+      # httpHeaderName1: Authorization
+    # secureJsonData:
+    #   httpHeaderValue1: "Bearer <token>"
