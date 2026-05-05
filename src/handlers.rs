@@ -15,6 +15,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use metrics::counter;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value as JsonValue};
 
@@ -171,6 +172,11 @@ pub async fn run_ingest(
             .map_err(|e| ApiError::internal(format!("ingest: {:#}", e)))?;
     }
 
+    counter!("skaldberg_ingest_accepted_total", "endpoint" => "ingest")
+        .increment(n_accepted as u64);
+    counter!("skaldberg_ingest_rejected_total", "endpoint" => "ingest")
+        .increment(rejected.len() as u64);
+
     Ok(Json(IngestResponse {
         accepted: n_accepted,
         rejected,
@@ -237,6 +243,7 @@ pub async fn run_remote_write(
         );
     }
 
+    let n_accepted = accepted.len();
     if !accepted.is_empty() {
         let st = state.clone();
         tokio::task::spawn_blocking(move || st.ingest.append_validated(accepted))
@@ -247,6 +254,11 @@ pub async fn run_remote_write(
                 message: format!("remote_write ingest: {:#}", e),
             })?;
     }
+
+    counter!("skaldberg_ingest_accepted_total", "endpoint" => "remote_write")
+        .increment(n_accepted as u64);
+    counter!("skaldberg_ingest_rejected_total", "endpoint" => "remote_write")
+        .increment(rejected_count as u64);
 
     Ok(StatusCode::NO_CONTENT)
 }

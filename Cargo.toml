@@ -65,6 +65,12 @@ snap = "1.1"
 async-trait = "0.1"
 futures = "0.3"
 
+# Metrics: facade + Prometheus exposition. Counters and histograms are
+# emitted via `metrics::{counter, histogram}` from the hot paths and
+# scraped over `/metrics`.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+
 # Errors / time
 anyhow = "1"
 thiserror = "1"
