@@ -1,0 +1,21 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Local runtime data (WAL, parquet, etc.)
+/data/
+/wh/
+
+# Logs
+*.log
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Python cache (smoke scripts only)
+__pycache__/
+*.pyc

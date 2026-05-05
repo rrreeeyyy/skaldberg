@@ -1,0 +1,68 @@
+[package]
+name = "skaldberg-server"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "skaldberg-server"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP
+axum = "0.7"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Phase 4: DataFusion replaces DuckDB. iceberg-datafusion bridges Iceberg
+# tables into DataFusion's TableProvider so SQL queries see them
+# transparently. iceberg-datafusion 0.9 pins datafusion ^52.2.
+datafusion = "52.2"
+iceberg = "0.9"
+iceberg-datafusion = "0.9"
+
+# Arrow / Parquet are re-exported from datafusion, but a few of our modules
+# (convert.rs, flush helpers) need the concrete types directly.
+# Same major as iceberg/datafusion's transitive arrow.
+arrow = "57"
+parquet = "57"
+
+# Phase 3 ingester: series_id derivation.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Phase 3 ingester: WAL record CRC.
+crc32fast = "1"
+
+# Phase 3.6 (Remote Write): protobuf decoding for Prometheus WriteRequest,
+# and raw snappy decompression. The Prometheus remote_write protocol uses
+# `application/x-protobuf` body, snappy-compressed (raw, not framed).
+prost = "0.13"
+snap = "1.1"
+
+# async support for Iceberg catalog/writer traits
+async-trait = "0.1"
+futures = "0.3"
+
+# Errors / time
+anyhow = "1"
+thiserror = "1"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+# LTO disabled in Phase 4 to keep build times reasonable on a single core.
+# Re-enable with `lto = "thin"` once we have CI / release infra that can
+# afford the extra link time.
+lto = false
