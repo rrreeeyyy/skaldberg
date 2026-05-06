@@ -2118,6 +2118,15 @@ async fn binary_instant_eval(
         .await;
     }
 
+    // Pure-selector × pure-selector: 1:1 label matching becomes a
+    // JOIN on a string-agg group key, with the binop applied per row.
+    if let (Some(lsel), Some(rsel)) = (pure_selector(lhs), pure_selector(rhs)) {
+        return vector_vector_instant_via_sql(
+            state, lsel, rsel, op, return_bool, time_us,
+        )
+        .await;
+    }
+
     let left = eval_side_instant(state, lhs, time_us).await?;
     let right = eval_side_instant(state, rhs, time_us).await?;
     Ok(match (left, right) {
@@ -2405,6 +2414,156 @@ async fn scalar_vector_instant_via_sql(
         }
     }
     Ok(out)
+}
+
+/// Build the per-side CTE chain for a vector × vector pushdown.
+/// Produces (no leading `WITH`) the SQL fragment:
+///   `<side>_latest AS (...), <side>_gk AS (...)`
+/// where `<side>_latest(series_id, value)` is the most recent
+/// sample per series in `[time-LOOKBACK, time]`, and
+/// `<side>_gk(series_id, group_key)` is a stable label-set string
+/// (sorted `k=v` joined by `,`). The same `unnest-in-SELECT`
+/// pattern as the histogram_quantile path is used because
+/// DataFusion 52 rejects `CROSS JOIN UNNEST` on the labels MAP as
+/// a correlated subquery.
+fn vector_side_ctes(side: &str, sel: &VectorSelector, time_window_clause: &str) -> String {
+    let cat = DF_CATALOG_NAME;
+    let mut conds = selector_predicates(sel);
+    conds.push(time_window_clause.to_string());
+    let where_clause = format!("WHERE {}", conds.join(" AND "));
+
+    format!(
+        "{side}_base AS ( \
+           SELECT sa.series_id, sa.value + 0.0 AS value, \
+                  ROW_NUMBER() OVER (PARTITION BY sa.series_id ORDER BY sa.timestamp DESC) AS rn \
+           FROM {cat}.skaldberg.samples sa \
+           JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
+           {where_clause} \
+         ), \
+         {side}_latest AS ( \
+           SELECT series_id, value FROM {side}_base WHERE rn = 1 \
+         ), \
+         {side}_gk_pairs AS ( \
+           SELECT u.series_id, u.k AS k, element_at(u.labels, u.k)[1] AS v \
+           FROM ( \
+             SELECT lt.series_id, s.labels, unnest(map_keys(s.labels)) AS k \
+             FROM {side}_latest lt \
+             JOIN {cat}.skaldberg.series s ON lt.series_id = s.series_id \
+           ) u \
+         ), \
+         {side}_gk AS ( \
+           SELECT series_id, \
+                  COALESCE(string_agg(k || '=' || v, ',' ORDER BY k), '') AS group_key \
+           FROM {side}_gk_pairs GROUP BY series_id \
+         )"
+    )
+}
+
+/// Pure-selector × pure-selector at one timestamp. 1:1 matching
+/// happens via a JOIN on a string-agg group_key built from each
+/// side's labels MAP. The binop is applied per matched row:
+///   - arithmetic / `bool` comparison: emit `<lhs op rhs>` and
+///     strip `__name__` (Prometheus convention).
+///   - filter comparison (no `bool`): WHERE-filter on the
+///     predicate, keep the lhs series's value, `metric_name`, and
+///     labels.
+///
+/// Regex matchers in either selector are dropped from
+/// `selector_predicates` and applied as a Rust post-filter, mirroring
+/// the existing single-selector path.
+async fn vector_vector_instant_via_sql(
+    state: &AppState,
+    lsel: &VectorSelector,
+    rsel: &VectorSelector,
+    op: BinOp,
+    return_bool: bool,
+    time_us: i64,
+) -> Result<Vec<InstantPoint>, PromError> {
+    let from_us = time_us - LOOKBACK_US;
+    let time_window = format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(from_us),
+        us_to_ts_lit(time_us),
+    );
+
+    let lhs_ctes = vector_side_ctes("lhs", lsel, &time_window);
+    let rhs_ctes = vector_side_ctes("rhs", rsel, &time_window);
+
+    let is_filter = op.is_comparison() && !return_bool;
+    let (metric_sel, value_sel, extra_where) = if is_filter {
+        (
+            "s.metric_name".to_string(),
+            "j.lhs_v".to_string(),
+            format!(" AND ({})", cmp_op_sql_pair(op)),
+        )
+    } else {
+        (
+            "''".to_string(),
+            binop_value_sql(op, "j.lhs_v", "j.rhs_v", return_bool),
+            String::new(),
+        )
+    };
+    let cat = DF_CATALOG_NAME;
+
+    let sql = format!(
+        "WITH {lhs_ctes}, {rhs_ctes}, \
+         joined AS ( \
+           SELECT lh.series_id AS lhs_sid, lh.value AS lhs_v, rh.value AS rhs_v \
+           FROM lhs_latest lh \
+           JOIN lhs_gk lgk ON lh.series_id = lgk.series_id \
+           JOIN rhs_gk rgk ON lgk.group_key = rgk.group_key \
+           JOIN rhs_latest rh ON rgk.series_id = rh.series_id \
+         ) \
+         SELECT {metric_sel} AS m_name, s.labels, ({value_sel}) AS value \
+         FROM joined j \
+         JOIN {cat}.skaldberg.series s ON j.lhs_sid = s.series_id \
+         WHERE TRUE{extra_where}"
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("vec-vec sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("vec-vec collect: {e}")))?;
+
+    // Apply regex matchers from either selector as a Rust post-filter.
+    let mut label_filters = label_filters_for_selector(lsel);
+    label_filters.extend(label_filters_for_selector(rsel));
+    let mut out = Vec::new();
+    for batch in batches {
+        let metric_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| PromError::internal("vec-vec metric_name col"))?;
+        let labels_col = batch.column(1).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("vec-vec labels col"))?;
+        let val_col = batch.column(2).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("vec-vec value col"))?;
+        for i in 0..batch.num_rows() {
+            let labels = labels_to_btree(labels_col, i)?;
+            if !label_filters.iter().all(|f| match_label(&labels, f)) {
+                continue;
+            }
+            if val_col.is_null(i) {
+                continue;
+            }
+            out.push(InstantPoint {
+                metric_name: metric_col.value(i).to_string(),
+                labels,
+                ts_us: time_us,
+                value: val_col.value(i),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// SQL fragment for the comparison-without-bool filter path,
+/// referencing the JOINed `j.lhs_v` / `j.rhs_v` columns directly.
+fn cmp_op_sql_pair(op: BinOp) -> String {
+    format!("j.lhs_v {} j.rhs_v", cmp_op_sql(op))
 }
 
 /// Range counterpart: every sample in the time window goes through
