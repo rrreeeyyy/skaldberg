@@ -1009,6 +1009,173 @@ async fn range_aggregate_over_rangefn_via_sql(
         .collect())
 }
 
+/// Matrix-query counterpart of `instant_histogram_quantile_via_sql`.
+/// Builds the same per-eval per-series rate CTE used by the bare
+/// `rate(...)` matrix path, then layers on the histogram_quantile
+/// pipeline with `eval_us` added to every PARTITION BY so each
+/// evaluation timestamp gets its own quantile per `(labels - le)`
+/// group.
+async fn range_histogram_quantile_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    range_us: i64,
+    fn_op: RangeFnOp,
+    quantile: f64,
+    start_us: i64,
+    end_us: i64,
+    step_us: i64,
+) -> Result<Vec<RangePoints>, PromError> {
+    let mut evals = Vec::new();
+    let mut t = start_us;
+    while t <= end_us {
+        evals.push(t);
+        if evals.len() > MAX_RANGE_EVALS {
+            return Err(PromError::bad_data(format!(
+                "range query produces > {MAX_RANGE_EVALS} eval points; pick a larger step"
+            )));
+        }
+        t = t.saturating_add(step_us);
+    }
+    if evals.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let global_lo = start_us.saturating_sub(range_us);
+    let mut sample_conds = selector_predicates(sel);
+    sample_conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(global_lo),
+        us_to_ts_lit(end_us),
+    ));
+    let sample_where = sample_conds.join(" AND ");
+
+    let mut values_parts = Vec::with_capacity(evals.len());
+    for v in &evals {
+        values_parts.push(format!("({v})"));
+    }
+    let values_clause = values_parts.join(", ");
+
+    let rate_ctes = per_series_rangefn_range_ctes(fn_op, range_us, &values_clause, &sample_where);
+    let cat = DF_CATALOG_NAME;
+    let q = quantile;
+
+    let sql = format!(
+        "{rate_ctes}, \
+         buckets AS ( \
+           SELECT ps.eval_us, ps.series_id, s.labels, ps.rate_v AS cum, \
+                  TRY_CAST( \
+                    CASE \
+                      WHEN lower(element_at(s.labels, 'le')[1]) IN ('+inf', 'inf') THEN 'Infinity' \
+                      WHEN lower(element_at(s.labels, 'le')[1]) = '-inf' THEN '-Infinity' \
+                      ELSE element_at(s.labels, 'le')[1] \
+                    END AS DOUBLE \
+                  ) AS le \
+           FROM per_series ps \
+           JOIN {cat}.skaldberg.series s ON ps.series_id = s.series_id \
+           WHERE element_at(s.labels, 'le') IS NOT NULL \
+         ), \
+         filtered_buckets AS ( \
+           SELECT * FROM buckets WHERE le IS NOT NULL \
+         ), \
+         gk_pairs AS ( \
+           SELECT u.eval_us, u.series_id, u.k AS k, element_at(u.labels, u.k)[1] AS v \
+           FROM ( \
+             SELECT eval_us, series_id, labels, unnest(map_keys(labels)) AS k \
+             FROM filtered_buckets \
+           ) u \
+           WHERE u.k != 'le' \
+         ), \
+         gk AS ( \
+           SELECT eval_us, series_id, \
+                  string_agg(k || '=' || v, ',' ORDER BY k) AS group_key \
+           FROM gk_pairs GROUP BY eval_us, series_id \
+         ), \
+         annotated AS ( \
+           SELECT b.eval_us, b.series_id, b.cum, b.le, \
+                  COALESCE(gk.group_key, '') AS group_key \
+           FROM filtered_buckets b \
+           LEFT JOIN gk ON b.eval_us = gk.eval_us AND b.series_id = gk.series_id \
+         ), \
+         ranked AS ( \
+           SELECT eval_us, series_id, group_key, le, cum, \
+                  LAG(le) OVER w AS prev_le, \
+                  LAG(cum) OVER w AS prev_cum, \
+                  MAX(cum) OVER (PARTITION BY eval_us, group_key) AS total, \
+                  ROW_NUMBER() OVER w AS rn \
+           FROM annotated \
+           WINDOW w AS (PARTITION BY eval_us, group_key ORDER BY le) \
+         ), \
+         rep AS ( \
+           SELECT group_key, MIN(series_id) AS rep_series_id \
+           FROM ranked GROUP BY group_key \
+         ), \
+         crossing AS ( \
+           SELECT eval_us, group_key, MIN(rn) AS first_rn \
+           FROM ranked \
+           WHERE total > 0 AND cum >= {q} * total \
+           GROUP BY eval_us, group_key \
+         ) \
+         SELECT s.labels, r.eval_us, \
+                CASE \
+                  WHEN r.le = CAST('Infinity' AS DOUBLE) THEN COALESCE(r.prev_le, 0.0) \
+                  WHEN r.cum - COALESCE(r.prev_cum, 0.0) <= 0 THEN r.le \
+                  ELSE COALESCE(r.prev_le, 0.0) \
+                       + (({q} * r.total - COALESCE(r.prev_cum, 0.0)) / (r.cum - COALESCE(r.prev_cum, 0.0))) \
+                         * (r.le - COALESCE(r.prev_le, 0.0)) \
+                END AS qv \
+         FROM crossing c \
+         JOIN ranked r ON c.eval_us = r.eval_us AND c.group_key = r.group_key AND c.first_rn = r.rn \
+         JOIN rep ON c.group_key = rep.group_key \
+         JOIN {cat}.skaldberg.series s ON rep.rep_series_id = s.series_id \
+         ORDER BY r.eval_us"
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("range hist_quantile sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("range hist_quantile collect: {e}")))?;
+
+    use arrow::array::Int64Array;
+    let mut by_group: BTreeMap<BTreeMap<String, String>, Vec<(i64, f64)>> = BTreeMap::new();
+    for batch in batches {
+        let labels_col = batch.column(0).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("range hist_quantile labels col"))?;
+        let eval_col = batch.column(1).as_any().downcast_ref::<Int64Array>()
+            .ok_or_else(|| PromError::internal("range hist_quantile eval_us col"))?;
+        let qv_col = batch.column(2).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("range hist_quantile qv col"))?;
+        for i in 0..batch.num_rows() {
+            if qv_col.is_null(i) {
+                continue;
+            }
+            let v = qv_col.value(i);
+            if !v.is_finite() {
+                continue;
+            }
+            let mut labels = labels_to_btree(labels_col, i)?;
+            labels.remove("le");
+            by_group
+                .entry(labels)
+                .or_default()
+                .push((eval_col.value(i), v));
+        }
+    }
+    Ok(by_group
+        .into_iter()
+        .filter(|(_, pts)| !pts.is_empty())
+        .map(|(labels, points)| RangePoints {
+            metric_name: String::new(),
+            labels,
+            points,
+        })
+        .collect())
+}
+
 /// Range counterpart of `per_series_rangefn_ctes`: yields one
 /// `(eval_us, series_id, rate_v)` row per `(eval, series)` pair
 /// for a range-function call evaluated at the given eval timestamps.
@@ -1262,6 +1429,20 @@ fn evaluate_range<'a>(
                 Ok(aggregate_range_points(inner_series, op, modifier))
             }
             Some(QueryKind::HistogramQuantile { quantile, inner }) => {
+                if quantile.is_finite() && quantile > 0.0 && quantile < 1.0 {
+                    if let Some(QueryKind::RangeFn {
+                        sel,
+                        range_us,
+                        op: fn_op,
+                    }) = detect_query_kind(inner)
+                    {
+                        return range_histogram_quantile_via_sql(
+                            state, sel, range_us, fn_op, quantile,
+                            start_us, end_us, step_us,
+                        )
+                        .await;
+                    }
+                }
                 let inner_series =
                     evaluate_range(state, inner, start_us, end_us, step_us).await?;
                 Ok(histogram_quantile_range(inner_series, quantile))
