@@ -18,7 +18,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use datafusion::prelude::SessionContext;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg_datafusion::IcebergCatalogProvider;
 use tracing::{info, warn};
 
@@ -36,12 +37,22 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub async fn open(wal_dir: &Path, catalog: &CatalogConfig) -> Result<Self> {
+    pub async fn open(
+        wal_dir: &Path,
+        catalog: &CatalogConfig,
+        query_memory_limit_bytes: usize,
+    ) -> Result<Self> {
         // 1. Catalog + tables.
         let tables = Arc::new(IcebergTables::open(catalog).await?);
 
-        // 2. DataFusion session.
-        let ctx = SessionContext::new();
+        // 2. DataFusion session, with a memory pool so a runaway
+        //    query gets a `ResourcesExhausted` error instead of OOMing
+        //    the process.
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(query_memory_limit_bytes, 1.0)
+            .build_arc()
+            .context("build datafusion runtime")?;
+        let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
         let cat_provider = IcebergCatalogProvider::try_new(tables.catalog.clone())
             .await
             .context("build IcebergCatalogProvider")?;
