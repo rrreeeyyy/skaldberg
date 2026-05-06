@@ -1,0 +1,15 @@
+apiVersion: 1
+
+providers:
+  - name: skaldberg-demo
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    updateIntervalSeconds: 10
+    options:
+      # Inside the container the dashboards JSON is mounted at this path
+      # (see docker-compose.yaml volumes).
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false
