@@ -450,6 +450,223 @@ fn build_range_fn_sql(op: RangeFnOp, where_clause: &str) -> String {
     }
 }
 
+/// Cap on evaluation timestamps for range range-fn queries. The
+/// SQL plan cross-joins every (eval, sample) pair, so a 1d range
+/// at 1s step (86400 evals) × hundreds of series × per-window
+/// samples easily explodes. Grafana panels normally pick steps
+/// that yield 100s–1000s of evals, so 11k leaves comfortable
+/// headroom while still rejecting pathological "1m step over a
+/// year" requests early instead of OOMing the planner.
+const MAX_RANGE_EVALS: usize = 11_000;
+
+/// Range-query counterpart of `instant_range_fn_via_sql`. Builds
+/// a single SQL plan that cross-joins every eval timestamp with
+/// the candidate samples, then evaluates the per-window rate /
+/// irate / increase / delta in DataFusion.
+///
+/// Eval timestamps are passed in as a `VALUES (...)` BIGINT list
+/// of microseconds since epoch. Each sample's per-eval window
+/// membership is enforced by `CAST(sa.timestamp AS BIGINT) > et.eval_us - <range_us>`
+/// in the JOIN. A coarser `BETWEEN` on `sa.timestamp` lives in
+/// the outer `WHERE` so Iceberg partition pruning still kicks in
+/// — only the per-eval narrowing happens on the cast int.
+async fn range_range_fn_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    range_us: i64,
+    op: RangeFnOp,
+    start_us: i64,
+    end_us: i64,
+    step_us: i64,
+) -> Result<Vec<RangePoints>, PromError> {
+    let mut evals = Vec::new();
+    let mut t = start_us;
+    while t <= end_us {
+        evals.push(t);
+        if evals.len() > MAX_RANGE_EVALS {
+            return Err(PromError::bad_data(format!(
+                "range query produces > {MAX_RANGE_EVALS} eval points; pick a larger step"
+            )));
+        }
+        t = t.saturating_add(step_us);
+    }
+    if evals.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let global_lo = start_us.saturating_sub(range_us);
+    let mut sample_conds = selector_predicates(sel);
+    sample_conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(global_lo),
+        us_to_ts_lit(end_us),
+    ));
+    let sample_where = sample_conds.join(" AND ");
+
+    let mut values_parts = Vec::with_capacity(evals.len());
+    for v in &evals {
+        values_parts.push(format!("({v})"));
+    }
+    let values_clause = values_parts.join(", ");
+
+    let sql = build_range_range_fn_sql(op, range_us, &values_clause, &sample_where);
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("range range_fn sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("range range_fn collect: {e}")))?;
+
+    use arrow::array::Int64Array;
+    let label_filters = label_filters_for_selector(sel);
+    let mut by_series: BTreeMap<String, RangePoints> = BTreeMap::new();
+    for batch in batches {
+        let metric_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| PromError::internal("rate range metric_name col"))?;
+        let labels_col = batch.column(1).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("rate range labels col"))?;
+        let eval_col = batch.column(2).as_any().downcast_ref::<Int64Array>()
+            .ok_or_else(|| PromError::internal("rate range eval_us col"))?;
+        let val_col = batch.column(3).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("rate range value col"))?;
+        for i in 0..batch.num_rows() {
+            let labels = labels_to_btree(labels_col, i)?;
+            if !label_filters.iter().all(|f| match_label(&labels, f)) {
+                continue;
+            }
+            if val_col.is_null(i) {
+                continue;
+            }
+            let v = val_col.value(i);
+            if !v.is_finite() {
+                continue;
+            }
+            let metric = metric_col.value(i).to_string();
+            let key = series_key(&metric, &labels);
+            let entry = by_series.entry(key).or_insert_with(|| RangePoints {
+                metric_name: metric,
+                labels,
+                points: Vec::new(),
+            });
+            entry.points.push((eval_col.value(i), v));
+        }
+    }
+    Ok(by_series.into_values().collect())
+}
+
+fn build_range_range_fn_sql(
+    op: RangeFnOp,
+    range_us: i64,
+    values_clause: &str,
+    sample_where: &str,
+) -> String {
+    let cat = DF_CATALOG_NAME;
+
+    // Cross-join base CTE: each sample paired with every eval whose
+    // (eval - range, eval] window contains it. `value + 0.0` and
+    // `CAST(... AS BIGINT)` strip Parquet field metadata so the
+    // downstream window functions plan cleanly (same workaround as
+    // the instant path).
+    let base = format!(
+        "base AS ( \
+           SELECT et.eval_us, sa.series_id, \
+                  CAST(sa.timestamp AS BIGINT) AS ts_us, \
+                  sa.value + 0.0 AS value \
+           FROM (VALUES {values_clause}) AS et(eval_us) \
+           JOIN {cat}.skaldberg.samples sa \
+             ON CAST(sa.timestamp AS BIGINT) > et.eval_us - {range_us} \
+            AND CAST(sa.timestamp AS BIGINT) <= et.eval_us \
+           JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
+           WHERE {sample_where} \
+         )"
+    );
+
+    match op {
+        RangeFnOp::Rate | RangeFnOp::Increase => {
+            let value_expr = if matches!(op, RangeFnOp::Rate) {
+                "total_delta * 1000000.0 / (last_ts_us - first_ts_us)"
+            } else {
+                "total_delta"
+            };
+            format!(
+                "WITH {base}, \
+                 adjusted AS ( \
+                   SELECT eval_us, series_id, ts_us, value, \
+                          LAG(value) OVER w AS prev_v \
+                   FROM base \
+                   WINDOW w AS (PARTITION BY eval_us, series_id ORDER BY ts_us) \
+                 ), \
+                 agg AS ( \
+                   SELECT eval_us, series_id, \
+                          SUM(CASE \
+                                WHEN prev_v IS NULL THEN CAST(0.0 AS DOUBLE) \
+                                WHEN value >= prev_v THEN value - prev_v \
+                                ELSE value \
+                              END) AS total_delta, \
+                          MAX(ts_us) AS last_ts_us, \
+                          MIN(ts_us) AS first_ts_us, \
+                          COUNT(*) AS n \
+                   FROM adjusted \
+                   GROUP BY eval_us, series_id \
+                 ) \
+                 SELECT s.metric_name, s.labels, a.eval_us, ({value_expr}) AS v \
+                 FROM agg a \
+                 JOIN {cat}.skaldberg.series s ON a.series_id = s.series_id \
+                 WHERE a.n >= 2 AND a.last_ts_us > a.first_ts_us \
+                 ORDER BY s.metric_name, a.eval_us"
+            )
+        }
+        RangeFnOp::Irate => {
+            format!(
+                "WITH {base}, \
+                 ranked AS ( \
+                   SELECT eval_us, series_id, ts_us, value, \
+                          LAG(value) OVER w AS prev_v, \
+                          LAG(ts_us) OVER w AS prev_ts_us, \
+                          ROW_NUMBER() OVER (PARTITION BY eval_us, series_id ORDER BY ts_us DESC) AS rn_desc, \
+                          COUNT(*) OVER (PARTITION BY eval_us, series_id) AS total_n \
+                   FROM base \
+                   WINDOW w AS (PARTITION BY eval_us, series_id ORDER BY ts_us) \
+                 ) \
+                 SELECT s.metric_name, s.labels, r.eval_us, \
+                        ((CASE WHEN value >= prev_v THEN value - prev_v ELSE value END) * 1000000.0 / (ts_us - prev_ts_us)) AS v \
+                 FROM ranked r \
+                 JOIN {cat}.skaldberg.series s ON r.series_id = s.series_id \
+                 WHERE r.rn_desc = 1 AND r.total_n >= 2 AND r.ts_us > r.prev_ts_us \
+                 ORDER BY s.metric_name, r.eval_us"
+            )
+        }
+        RangeFnOp::Delta => {
+            format!(
+                "WITH {base}, \
+                 ranked AS ( \
+                   SELECT eval_us, series_id, value, \
+                          ROW_NUMBER() OVER (PARTITION BY eval_us, series_id ORDER BY ts_us ASC) AS rn_asc, \
+                          ROW_NUMBER() OVER (PARTITION BY eval_us, series_id ORDER BY ts_us DESC) AS rn_desc, \
+                          COUNT(*) OVER (PARTITION BY eval_us, series_id) AS total_n \
+                   FROM base \
+                 ), \
+                 endpoints AS ( \
+                   SELECT eval_us, series_id, value AS first_v, total_n FROM ranked WHERE rn_asc = 1 \
+                 ), \
+                 last_v AS ( \
+                   SELECT eval_us, series_id, value AS last_val FROM ranked WHERE rn_desc = 1 \
+                 ) \
+                 SELECT s.metric_name, s.labels, e.eval_us, (l.last_val - e.first_v) AS v \
+                 FROM endpoints e \
+                 JOIN last_v l ON e.eval_us = l.eval_us AND e.series_id = l.series_id \
+                 JOIN {cat}.skaldberg.series s ON e.series_id = s.series_id \
+                 WHERE e.total_n >= 2 \
+                 ORDER BY s.metric_name, e.eval_us"
+            )
+        }
+    }
+}
+
 /// Group instant points by retained labels, then collapse with `op`.
 /// Aggregations strip `__name__` (Prometheus convention).
 fn aggregate_instant_points(
@@ -550,7 +767,7 @@ fn evaluate_range<'a>(
                 sel,
                 range_us,
                 op,
-            }) => range_range_fn(state, sel, range_us, op, start_us, end_us, step_us).await,
+            }) => range_range_fn_via_sql(state, sel, range_us, op, start_us, end_us, step_us).await,
             Some(QueryKind::Aggregate {
                 op,
                 modifier,
@@ -621,49 +838,6 @@ async fn range_selector(
             points,
         })
         .collect())
-}
-
-async fn range_range_fn(
-    state: &AppState,
-    sel: &VectorSelector,
-    range_us: i64,
-    op: RangeFnOp,
-    start_us: i64,
-    end_us: i64,
-    step_us: i64,
-) -> Result<Vec<RangePoints>, PromError> {
-    // Pull samples covering every step's lookback window in one go,
-    // then bucket per-series and walk the steps in Rust.
-    let fetch_from = start_us - range_us;
-    let rows = run_selector_query(state, sel, fetch_from, end_us).await?;
-    let by_series = group_rows_by_series(rows);
-    let mut out = Vec::new();
-    for (_, (metric_name, labels, mut points)) in by_series {
-        points.sort_by_key(|(t, _)| *t);
-        let mut series_points: Vec<(i64, f64)> = Vec::new();
-        let mut t = start_us;
-        while t <= end_us {
-            // Window is `(t - range, t]` per Prometheus convention.
-            // partition_point keeps this O((N+M) log N) on long ranges.
-            let lo_ts = t - range_us;
-            let lo = points.partition_point(|(ts, _)| *ts < lo_ts);
-            let hi = points.partition_point(|(ts, _)| *ts <= t);
-            if hi.saturating_sub(lo) >= 2 {
-                if let Some(v) = compute_range_fn(&points[lo..hi], op) {
-                    series_points.push((t, v));
-                }
-            }
-            t += step_us;
-        }
-        if !series_points.is_empty() {
-            out.push(RangePoints {
-                metric_name,
-                labels,
-                points: series_points,
-            });
-        }
-    }
-    Ok(out)
 }
 
 /// Returns the inner `VectorSelector` if `expr` is a pure selector
@@ -1970,87 +2144,6 @@ fn group_rows_by_series(
         entry.2.push((r.ts_us, r.value));
     }
     by_series
-}
-
-/// Apply a range-vector function to a sorted slice of (ts_us, value).
-///
-/// We do **not** apply Prometheus's extrapolation to the range edges
-/// for `rate / increase`, so on short windows numbers will differ
-/// slightly from a real Prometheus server. Magnitudes and shapes are
-/// correct, which is what panels need.
-fn compute_range_fn(points: &[(i64, f64)], op: RangeFnOp) -> Option<f64> {
-    match op {
-        RangeFnOp::Rate => {
-            let (delta, secs) = delta_with_reset_and_secs(points)?;
-            Some(delta / secs)
-        }
-        RangeFnOp::Increase => {
-            // Same `delta` as rate; just don't divide by time.
-            // Equivalent to `rate * range_secs` — Prometheus
-            // documents it that way.
-            let (delta, _) = delta_with_reset_and_secs(points)?;
-            Some(delta)
-        }
-        RangeFnOp::Irate => {
-            // Per-second rate from only the last two samples in the
-            // window. Used for "show me the most recent slope" panels.
-            let n = points.len();
-            if n < 2 {
-                return None;
-            }
-            let (prev_ts, prev_v) = points[n - 2];
-            let (curr_ts, curr_v) = points[n - 1];
-            let secs = (curr_ts - prev_ts) as f64 / 1_000_000.0;
-            if secs <= 0.0 {
-                return None;
-            }
-            let delta = if curr_v >= prev_v {
-                curr_v - prev_v
-            } else {
-                // Counter-reset adjustment, same as in rate.
-                curr_v
-            };
-            Some(delta / secs)
-        }
-        RangeFnOp::Delta => {
-            // Gauge delta: trust the values, don't reset-adjust.
-            // For counters use `increase` instead.
-            if points.len() < 2 {
-                return None;
-            }
-            let first = points.first()?.1;
-            let last = points.last()?.1;
-            Some(last - first)
-        }
-    }
-}
-
-/// Walk an ascending-sorted slice pairwise, summing positive deltas
-/// and treating each drop as `curr` (counter-reset adjustment).
-/// Returns `(delta, seconds_between_first_and_last)`.
-fn delta_with_reset_and_secs(points: &[(i64, f64)]) -> Option<(f64, f64)> {
-    if points.len() < 2 {
-        return None;
-    }
-    let first_ts = points.first()?.0;
-    let last_ts = points.last()?.0;
-    let secs = (last_ts - first_ts) as f64 / 1_000_000.0;
-    if secs <= 0.0 {
-        return None;
-    }
-    let mut delta = 0.0_f64;
-    for w in points.windows(2) {
-        let prev = w[0].1;
-        let curr = w[1].1;
-        if curr >= prev {
-            delta += curr - prev;
-        } else {
-            // Counter reset — assume the underlying counter went
-            // 0 → curr in the gap.
-            delta += curr;
-        }
-    }
-    Some((delta, secs))
 }
 
 // ---------- /api/v1/labels ----------
