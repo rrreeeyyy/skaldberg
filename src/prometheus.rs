@@ -1096,8 +1096,14 @@ fn delta_with_reset_and_secs(points: &[(i64, f64)]) -> Option<(f64, f64)> {
 pub async fn labels(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<JsonValue>, PromError> {
+    // Distinct label-name list, computed in DataFusion: explode the
+    // labels MAP into one row per (series, key), then DISTINCT.
+    // `__name__` isn't a real key in `labels`; we splice it in
+    // unconditionally on the Rust side.
     let sql = format!(
-        "SELECT labels FROM {}.skaldberg.series",
+        "SELECT DISTINCT k FROM \
+         (SELECT unnest(map_keys(s.labels)) AS k FROM {}.skaldberg.series s) \
+         ORDER BY k",
         DF_CATALOG_NAME
     );
     let df = state
@@ -1112,13 +1118,15 @@ pub async fn labels(
     let mut keys: BTreeSet<String> = BTreeSet::new();
     keys.insert("__name__".to_string());
     for batch in batches {
-        let labels_col = batch
+        let col = batch
             .column(0)
             .as_any()
-            .downcast_ref::<MapArray>()
-            .ok_or_else(|| PromError::internal("labels col not Map"))?;
-        for i in 0..batch.num_rows() {
-            collect_label_keys(labels_col, i, &mut keys)?;
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| PromError::internal("labels col not Utf8"))?;
+        for i in 0..col.len() {
+            if !col.is_null(i) {
+                keys.insert(col.value(i).to_string());
+            }
         }
     }
     Ok(Json(json!({
@@ -1133,63 +1141,53 @@ pub async fn label_values(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<JsonValue>, PromError> {
-    let mut values: BTreeSet<String> = BTreeSet::new();
-    if name == "__name__" {
-        let sql = format!(
-            "SELECT DISTINCT metric_name FROM {}.skaldberg.series",
+    // Both branches do `SELECT DISTINCT ... ORDER BY ...` in
+    // DataFusion. The `__name__` shortcut hits the dedicated
+    // `metric_name` column on the `series` table; everything else
+    // goes through `element_at(labels, key)[1]` (the same trick
+    // the matcher pushdown uses) with a NULL filter so series
+    // missing the label simply don't contribute.
+    let sql = if name == "__name__" {
+        format!(
+            "SELECT DISTINCT metric_name AS v FROM {}.skaldberg.series ORDER BY v",
             DF_CATALOG_NAME
-        );
-        let df = state
-            .ctx
-            .sql(&sql)
-            .await
-            .map_err(|e| PromError::internal(format!("label_values sql: {e}")))?;
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| PromError::internal(format!("collect: {e}")))?;
-        for batch in batches {
-            let col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| PromError::internal("metric_name col not Utf8"))?;
-            for i in 0..col.len() {
-                if !col.is_null(i) {
-                    values.insert(col.value(i).to_string());
-                }
-            }
-        }
+        )
     } else {
-        let sql = format!(
-            "SELECT labels FROM {}.skaldberg.series",
+        let escaped = sql_escape(&name);
+        format!(
+            "SELECT DISTINCT element_at(labels, '{escaped}')[1] AS v \
+             FROM {}.skaldberg.series \
+             WHERE element_at(labels, '{escaped}')[1] IS NOT NULL \
+             ORDER BY v",
             DF_CATALOG_NAME
-        );
-        let df = state
-            .ctx
-            .sql(&sql)
-            .await
-            .map_err(|e| PromError::internal(format!("label_values sql: {e}")))?;
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| PromError::internal(format!("collect: {e}")))?;
-        for batch in batches {
-            let labels_col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<MapArray>()
-                .ok_or_else(|| PromError::internal("labels col not Map"))?;
-            for i in 0..batch.num_rows() {
-                if let Some(v) = label_value_at(labels_col, i, &name)? {
-                    values.insert(v);
-                }
+        )
+    };
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("label_values sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("collect: {e}")))?;
+    let mut values: Vec<String> = Vec::new();
+    for batch in batches {
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| PromError::internal("label value col not Utf8"))?;
+        for i in 0..col.len() {
+            if !col.is_null(i) {
+                values.push(col.value(i).to_string());
             }
         }
     }
     Ok(Json(json!({
         "status": "success",
-        "data": values.into_iter().collect::<Vec<_>>(),
+        "data": values,
     })))
 }
 
@@ -1807,63 +1805,6 @@ fn labels_to_btree(
         }
     }
     Ok(out)
-}
-
-fn collect_label_keys(
-    labels: &MapArray,
-    i: usize,
-    set: &mut BTreeSet<String>,
-) -> Result<(), PromError> {
-    if labels.is_null(i) {
-        return Ok(());
-    }
-    let entries = labels.value(i);
-    let entries = entries
-        .as_any()
-        .downcast_ref::<arrow::array::StructArray>()
-        .ok_or_else(|| PromError::internal("labels entries not Struct"))?;
-    let keys = entries
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| PromError::internal("labels.key not Utf8"))?;
-    for j in 0..entries.len() {
-        if !keys.is_null(j) {
-            set.insert(keys.value(j).to_string());
-        }
-    }
-    Ok(())
-}
-
-fn label_value_at(
-    labels: &MapArray,
-    i: usize,
-    key_name: &str,
-) -> Result<Option<String>, PromError> {
-    if labels.is_null(i) {
-        return Ok(None);
-    }
-    let entries = labels.value(i);
-    let entries = entries
-        .as_any()
-        .downcast_ref::<arrow::array::StructArray>()
-        .ok_or_else(|| PromError::internal("labels entries not Struct"))?;
-    let keys = entries
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| PromError::internal("labels.key not Utf8"))?;
-    let values = entries
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| PromError::internal("labels.value not Utf8"))?;
-    for j in 0..entries.len() {
-        if !keys.is_null(j) && keys.value(j) == key_name && !values.is_null(j) {
-            return Ok(Some(values.value(j).to_string()));
-        }
-    }
-    Ok(None)
 }
 
 fn series_key(metric_name: &str, labels: &BTreeMap<String, String>) -> String {
