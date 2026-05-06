@@ -14,6 +14,7 @@ mod prometheus;
 mod state;
 
 use std::env;
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -274,9 +275,10 @@ async fn main() -> Result<()> {
 
     // Graceful shutdown:
     //
-    //   1. Wait for SIGTERM / Ctrl-C.
+    //   1. Run the server until SIGTERM / Ctrl-C.
     //   2. Tell axum to stop accepting new connections and let the
-    //      in-flight requests drain (bounded by `shutdown_timeout`).
+    //      in-flight requests drain (bounded by `shutdown_timeout`,
+    //      measured **from signal time**, not from server start).
     //      We deliberately do NOT flush here — flushing while ingest
     //      requests are still landing would race with the buffer.
     //   3. Once the listener is fully drained (or we time out
@@ -287,15 +289,43 @@ async fn main() -> Result<()> {
     // we move on anyway — the orchestrator's SIGKILL window is the
     // real wall, and a partial-but-flushed buffer is better than an
     // intact-but-never-committed one.
-    let server_fut = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+    //
+    // Implementation note: the drain timeout MUST start after the
+    // signal fires. Wrapping `axum::serve(...).with_graceful_shutdown(...)`
+    // in a single `tokio::time::timeout(shutdown_timeout, ...)` would
+    // cap the entire server lifetime at `shutdown_timeout`, killing
+    // long-lived deployments. Use a `Notify` to record signal time,
+    // then start the drain clock only once that fires.
+    let signal_fired = std::sync::Arc::new(tokio::sync::Notify::new());
+    let signal_fired_inner = signal_fired.clone();
+    let server_fut = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            signal_fired_inner.notify_one();
+        })
+        .into_future();
+    tokio::pin!(server_fut);
 
-    match tokio::time::timeout(args.shutdown_timeout, server_fut).await {
-        Ok(Ok(())) => info!("listener drained"),
-        Ok(Err(e)) => tracing::error!(error = %e, "server returned error during shutdown"),
-        Err(_) => tracing::warn!(
-            timeout_secs = args.shutdown_timeout.as_secs(),
-            "listener did not drain in time, proceeding to final flush",
-        ),
+    tokio::select! {
+        // The server resolves on its own only after the signal fires
+        // *and* in-flight requests drain. Without a signal, this arm
+        // never fires.
+        res = &mut server_fut => match res {
+            Ok(()) => info!("listener drained"),
+            Err(e) => tracing::error!(error = %e, "server returned error during shutdown"),
+        },
+        // Signal fired but the listener hasn't drained yet — start
+        // the timeout clock and race the drain against it.
+        _ = signal_fired.notified() => {
+            match tokio::time::timeout(args.shutdown_timeout, &mut server_fut).await {
+                Ok(Ok(())) => info!("listener drained"),
+                Ok(Err(e)) => tracing::error!(error = %e, "server returned error during shutdown"),
+                Err(_) => tracing::warn!(
+                    timeout_secs = args.shutdown_timeout.as_secs(),
+                    "listener did not drain in time, proceeding to final flush",
+                ),
+            }
+        }
     }
 
     info!("running final flush before exit");
