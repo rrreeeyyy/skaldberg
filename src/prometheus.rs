@@ -1598,16 +1598,39 @@ async fn run_selector_query(
     from_us: i64,
     to_us: i64,
 ) -> Result<Vec<SeriesRow>, PromError> {
-    // SQL filters: metric_name (push-down friendly) and the time
-    // window. Label matchers are evaluated in Rust below — DataFusion
-    // 52 doesn't expose a clean Map<Utf8,Utf8> equality predicate, so
-    // pushing them down would require fragile workarounds. The
-    // (metric_name, timerange) prefilter alone is selective enough
-    // for the data shapes we care about; if that ever stops being
-    // true we'll push labels down properly.
+    // SQL filters: metric_name, time window, and any label matcher
+    // we can push down via the `map_get_string` UDF (= and !=).
+    // Regex matchers stay in Rust below — DataFusion's regexp_match
+    // would need a slightly different rewrite.
     let mut conds = Vec::new();
     if let Some(name) = effective_metric_name(sel) {
         conds.push(format!("s.metric_name = '{}'", sql_escape(&name)));
+    }
+    // DataFusion 52's `element_at(map, key)` returns `List<Utf8>`,
+    // which won't compare against a `Utf8` directly. Index it with
+    // `[1]` (List indexing is 1-based) to drop down to a scalar
+    // `Utf8` we can equate. A missing key yields NULL, which
+    // `COALESCE(..., '')` turns into the empty string for the
+    // PromQL `!=` semantics ("missing label is empty").
+    for m in &sel.matchers.matchers {
+        if m.name == "__name__" {
+            continue;
+        }
+        let key = sql_escape(&m.name);
+        let val = sql_escape(&m.value);
+        match &m.op {
+            MatchOp::Equal => {
+                conds.push(format!("element_at(s.labels, '{key}')[1] = '{val}'"));
+            }
+            MatchOp::NotEqual => {
+                conds.push(format!(
+                    "COALESCE(element_at(s.labels, '{key}')[1], '') != '{val}'"
+                ));
+            }
+            MatchOp::Re(_) | MatchOp::NotRe(_) => {
+                // Pushed down to Rust below.
+            }
+        }
     }
     conds.push(format!(
         "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
@@ -1688,13 +1711,16 @@ fn effective_metric_name(sel: &VectorSelector) -> Option<String> {
         .map(|m| m.value.clone())
 }
 
-/// Return label matchers that need post-filtering in Rust (everything
-/// except the `__name__` matcher, which we push down via metric_name).
+/// Return label matchers that need post-filtering in Rust. `=` /
+/// `!=` are pushed to SQL via `map_get_string`; only regex
+/// matchers (`=~` / `!~`) and any future shapes the SQL path
+/// can't express stay here.
 fn label_filters_for_selector(sel: &VectorSelector) -> Vec<&Matcher> {
     sel.matchers
         .matchers
         .iter()
         .filter(|m| m.name != "__name__")
+        .filter(|m| matches!(m.op, MatchOp::Re(_) | MatchOp::NotRe(_)))
         .collect()
 }
 
