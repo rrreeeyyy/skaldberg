@@ -41,7 +41,10 @@ use axum::response::{IntoResponse, Response};
 use axum::{Form, Json};
 use chrono::{DateTime, Utc};
 use promql_parser::label::{MatchOp, Matcher};
-use promql_parser::parser::token::{T_AVG, T_BOTTOMK, T_COUNT, T_MAX, T_MIN, T_SUM, T_TOPK};
+use promql_parser::parser::token::{
+    T_ADD, T_AVG, T_BOTTOMK, T_COUNT, T_DIV, T_EQLC, T_GTE, T_GTR, T_LTE, T_LSS, T_MAX, T_MIN,
+    T_MOD, T_MUL, T_NEQ, T_POW, T_SUB, T_SUM, T_TOPK,
+};
 use promql_parser::parser::{parse, Expr, LabelModifier, VectorSelector};
 use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
@@ -180,6 +183,12 @@ fn evaluate_instant<'a>(state: &'a AppState, expr: &'a Expr, time_us: i64) -> In
                 let inner_pts = evaluate_instant(state, inner, time_us).await?;
                 Ok(topk_instant_points(inner_pts, n, top, modifier))
             }
+            Some(QueryKind::Binary {
+                op,
+                lhs,
+                rhs,
+                return_bool,
+            }) => binary_instant_eval(state, lhs, rhs, op, return_bool, time_us).await,
             None => Ok(vec![]),
         }
     })
@@ -362,6 +371,15 @@ fn evaluate_range<'a>(
                 let inner_series =
                     evaluate_range(state, inner, start_us, end_us, step_us).await?;
                 Ok(topk_range_points(inner_series, n, top, modifier))
+            }
+            Some(QueryKind::Binary {
+                op,
+                lhs,
+                rhs,
+                return_bool,
+            }) => {
+                binary_range_eval(state, lhs, rhs, op, return_bool, start_us, end_us, step_us)
+                    .await
             }
             None => Ok(vec![]),
         }
@@ -565,6 +583,248 @@ fn topk_range_points(
         }
     }
     out_map.into_values().collect()
+}
+
+/// Evaluate a binary expression at a single timestamp. Each side is
+/// either a NumberLiteral (treated as a scalar that applies to every
+/// matching series) or a vector. We don't handle on/ignoring
+/// modifiers: vector × vector matching uses the full label set.
+async fn binary_instant_eval(
+    state: &AppState,
+    lhs: &Expr,
+    rhs: &Expr,
+    op: BinOp,
+    return_bool: bool,
+    time_us: i64,
+) -> Result<Vec<InstantPoint>, PromError> {
+    let left = eval_side_instant(state, lhs, time_us).await?;
+    let right = eval_side_instant(state, rhs, time_us).await?;
+    Ok(match (left, right) {
+        (Side::Scalar(s), Side::Vector(pts)) => {
+            apply_scalar_vector_instant(s, pts, op, return_bool, /* scalar_on_left */ true)
+        }
+        (Side::Vector(pts), Side::Scalar(s)) => {
+            apply_scalar_vector_instant(s, pts, op, return_bool, /* scalar_on_left */ false)
+        }
+        (Side::Vector(lpts), Side::Vector(rpts)) => {
+            apply_vector_vector_instant(lpts, rpts, op, return_bool)
+        }
+        (Side::Scalar(_), Side::Scalar(_)) => {
+            // Two scalars in a binary op is a real Prometheus case
+            // (`scalar(...)` etc) but doesn't appear in panel queries.
+            // Skip for now — no series to emit.
+            Vec::new()
+        }
+    })
+}
+
+async fn binary_range_eval(
+    state: &AppState,
+    lhs: &Expr,
+    rhs: &Expr,
+    op: BinOp,
+    return_bool: bool,
+    start_us: i64,
+    end_us: i64,
+    step_us: i64,
+) -> Result<Vec<RangePoints>, PromError> {
+    let left = eval_side_range(state, lhs, start_us, end_us, step_us).await?;
+    let right = eval_side_range(state, rhs, start_us, end_us, step_us).await?;
+    Ok(match (left, right) {
+        (SideR::Scalar(s), SideR::Vector(series)) => {
+            apply_scalar_vector_range(s, series, op, return_bool, true)
+        }
+        (SideR::Vector(series), SideR::Scalar(s)) => {
+            apply_scalar_vector_range(s, series, op, return_bool, false)
+        }
+        (SideR::Vector(l), SideR::Vector(r)) => {
+            apply_vector_vector_range(l, r, op, return_bool)
+        }
+        (SideR::Scalar(_), SideR::Scalar(_)) => Vec::new(),
+    })
+}
+
+enum Side {
+    Scalar(f64),
+    Vector(Vec<InstantPoint>),
+}
+
+enum SideR {
+    Scalar(f64),
+    Vector(Vec<RangePoints>),
+}
+
+async fn eval_side_instant(
+    state: &AppState,
+    expr: &Expr,
+    time_us: i64,
+) -> Result<Side, PromError> {
+    if let Expr::NumberLiteral(num) = expr {
+        return Ok(Side::Scalar(num.val));
+    }
+    Ok(Side::Vector(evaluate_instant(state, expr, time_us).await?))
+}
+
+async fn eval_side_range(
+    state: &AppState,
+    expr: &Expr,
+    start_us: i64,
+    end_us: i64,
+    step_us: i64,
+) -> Result<SideR, PromError> {
+    if let Expr::NumberLiteral(num) = expr {
+        return Ok(SideR::Scalar(num.val));
+    }
+    Ok(SideR::Vector(
+        evaluate_range(state, expr, start_us, end_us, step_us).await?,
+    ))
+}
+
+fn apply_scalar_vector_instant(
+    scalar: f64,
+    pts: Vec<InstantPoint>,
+    op: BinOp,
+    return_bool: bool,
+    scalar_on_left: bool,
+) -> Vec<InstantPoint> {
+    pts.into_iter()
+        .filter_map(|mut p| {
+            let (a, b) = if scalar_on_left {
+                (scalar, p.value)
+            } else {
+                (p.value, scalar)
+            };
+            if op.is_comparison() && !return_bool {
+                if comparison_passes(a, b, op) {
+                    Some(p)
+                } else {
+                    None
+                }
+            } else {
+                p.value = apply_bin_value(a, b, op);
+                // Arithmetic / `bool` comparison strips __name__
+                // (Prometheus convention).
+                p.metric_name = String::new();
+                Some(p)
+            }
+        })
+        .collect()
+}
+
+fn apply_scalar_vector_range(
+    scalar: f64,
+    series: Vec<RangePoints>,
+    op: BinOp,
+    return_bool: bool,
+    scalar_on_left: bool,
+) -> Vec<RangePoints> {
+    series
+        .into_iter()
+        .map(|mut s| {
+            s.points = s
+                .points
+                .into_iter()
+                .filter_map(|(ts, v)| {
+                    let (a, b) = if scalar_on_left { (scalar, v) } else { (v, scalar) };
+                    if op.is_comparison() && !return_bool {
+                        if comparison_passes(a, b, op) {
+                            Some((ts, v))
+                        } else {
+                            None
+                        }
+                    } else {
+                        Some((ts, apply_bin_value(a, b, op)))
+                    }
+                })
+                .collect();
+            if !(op.is_comparison() && !return_bool) {
+                s.metric_name = String::new();
+            }
+            s
+        })
+        .filter(|s| !s.points.is_empty())
+        .collect()
+}
+
+fn apply_vector_vector_instant(
+    lhs: Vec<InstantPoint>,
+    rhs: Vec<InstantPoint>,
+    op: BinOp,
+    return_bool: bool,
+) -> Vec<InstantPoint> {
+    let mut rhs_index: BTreeMap<BTreeMap<String, String>, &InstantPoint> = BTreeMap::new();
+    for r in &rhs {
+        rhs_index.insert(r.labels.clone(), r);
+    }
+    let mut out = Vec::new();
+    for l in &lhs {
+        if let Some(r) = rhs_index.get(&l.labels) {
+            if op.is_comparison() && !return_bool {
+                if comparison_passes(l.value, r.value, op) {
+                    out.push(InstantPoint {
+                        metric_name: l.metric_name.clone(),
+                        labels: l.labels.clone(),
+                        ts_us: l.ts_us,
+                        value: l.value,
+                    });
+                }
+            } else {
+                out.push(InstantPoint {
+                    metric_name: String::new(),
+                    labels: l.labels.clone(),
+                    ts_us: l.ts_us,
+                    value: apply_bin_value(l.value, r.value, op),
+                });
+            }
+        }
+    }
+    out
+}
+
+fn apply_vector_vector_range(
+    lhs: Vec<RangePoints>,
+    rhs: Vec<RangePoints>,
+    op: BinOp,
+    return_bool: bool,
+) -> Vec<RangePoints> {
+    // Index rhs by full label set for O(log) lookup; per-series points
+    // are also kept as BTreeMap<ts, v> so we can align by timestamp.
+    let mut rhs_index: BTreeMap<BTreeMap<String, String>, BTreeMap<i64, f64>> =
+        BTreeMap::new();
+    for r in rhs {
+        rhs_index.insert(r.labels, r.points.into_iter().collect());
+    }
+    let mut out = Vec::new();
+    for l in lhs {
+        let r_pts = match rhs_index.get(&l.labels) {
+            Some(m) => m,
+            None => continue,
+        };
+        let mut new_points: Vec<(i64, f64)> = Vec::new();
+        for (ts, lv) in l.points {
+            if let Some(&rv) = r_pts.get(&ts) {
+                if op.is_comparison() && !return_bool {
+                    if comparison_passes(lv, rv, op) {
+                        new_points.push((ts, lv));
+                    }
+                } else {
+                    new_points.push((ts, apply_bin_value(lv, rv, op)));
+                }
+            }
+        }
+        if !new_points.is_empty() {
+            out.push(RangePoints {
+                metric_name: if op.is_comparison() && !return_bool {
+                    l.metric_name
+                } else {
+                    String::new()
+                },
+                labels: l.labels,
+                points: new_points,
+            });
+        }
+    }
+    out
 }
 
 /// Reduce a vector of histogram-bucket points (each carrying an
@@ -1060,6 +1320,41 @@ enum QueryKind<'a> {
         modifier: Option<&'a LabelModifier>,
         inner: &'a Expr,
     },
+    /// Binary operator between two operands. Each side is either a
+    /// scalar (NumberLiteral) or a vector. Only complete-label-set
+    /// 1:1 matching is supported — `on(...)` / `ignoring(...)` /
+    /// `group_left` / `group_right` are deferred.
+    Binary {
+        op: BinOp,
+        lhs: &'a Expr,
+        rhs: &'a Expr,
+        return_bool: bool,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl BinOp {
+    fn is_comparison(self) -> bool {
+        matches!(
+            self,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1124,6 +1419,20 @@ fn detect_query_kind(expr: &Expr) -> Option<QueryKind<'_>> {
         // — fall through to selector unwrap so the panel still draws
         // something instead of erroring.
     }
+    if let Expr::Binary(b) = expr {
+        if let Some(op) = parse_bin_op(b.op.id()) {
+            return Some(QueryKind::Binary {
+                op,
+                lhs: b.lhs.as_ref(),
+                rhs: b.rhs.as_ref(),
+                return_bool: b
+                    .modifier
+                    .as_ref()
+                    .map(|m| m.return_bool)
+                    .unwrap_or(false),
+            });
+        }
+    }
     if let Expr::Call(c) = expr {
         if c.func.name.eq_ignore_ascii_case("histogram_quantile") && c.args.args.len() == 2 {
             if let Expr::NumberLiteral(num) = c.args.args[0].as_ref() {
@@ -1155,6 +1464,57 @@ fn parse_range_fn_op(name: &str) -> Option<RangeFnOp> {
         "increase" => Some(RangeFnOp::Increase),
         "delta" => Some(RangeFnOp::Delta),
         _ => None,
+    }
+}
+
+fn parse_bin_op(id: u8) -> Option<BinOp> {
+    match id {
+        x if x == T_ADD => Some(BinOp::Add),
+        x if x == T_SUB => Some(BinOp::Sub),
+        x if x == T_MUL => Some(BinOp::Mul),
+        x if x == T_DIV => Some(BinOp::Div),
+        x if x == T_MOD => Some(BinOp::Mod),
+        x if x == T_POW => Some(BinOp::Pow),
+        x if x == T_EQLC => Some(BinOp::Eq),
+        x if x == T_NEQ => Some(BinOp::Ne),
+        x if x == T_LSS => Some(BinOp::Lt),
+        x if x == T_LTE => Some(BinOp::Le),
+        x if x == T_GTR => Some(BinOp::Gt),
+        x if x == T_GTE => Some(BinOp::Ge),
+        // T_LAND / T_LOR / T_LUNLESS are deferred (logical ops).
+        _ => None,
+    }
+}
+
+fn apply_bin_value(a: f64, b: f64, op: BinOp) -> f64 {
+    match op {
+        BinOp::Add => a + b,
+        BinOp::Sub => a - b,
+        BinOp::Mul => a * b,
+        BinOp::Div => a / b,
+        BinOp::Mod => a % b,
+        BinOp::Pow => a.powf(b),
+        // For comparisons the "value" form returns 0/1; the filter
+        // form (default in Prometheus) is decided by the caller and
+        // uses the original lhs value instead.
+        BinOp::Eq => f64::from(u8::from(a == b)),
+        BinOp::Ne => f64::from(u8::from(a != b)),
+        BinOp::Lt => f64::from(u8::from(a < b)),
+        BinOp::Le => f64::from(u8::from(a <= b)),
+        BinOp::Gt => f64::from(u8::from(a > b)),
+        BinOp::Ge => f64::from(u8::from(a >= b)),
+    }
+}
+
+fn comparison_passes(a: f64, b: f64, op: BinOp) -> bool {
+    match op {
+        BinOp::Eq => a == b,
+        BinOp::Ne => a != b,
+        BinOp::Lt => a < b,
+        BinOp::Le => a <= b,
+        BinOp::Gt => a > b,
+        BinOp::Ge => a >= b,
+        _ => true,
     }
 }
 
