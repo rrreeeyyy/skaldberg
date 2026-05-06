@@ -1101,6 +1101,15 @@ async fn binary_instant_eval(
     return_bool: bool,
     time_us: i64,
 ) -> Result<Vec<InstantPoint>, PromError> {
+    // Scalar × pure-selector: push the row-level transform / filter
+    // straight into SQL instead of pulling every sample into Rust.
+    if let Some((scalar, sel, scalar_on_left)) = scalar_vector_pair(lhs, rhs) {
+        return scalar_vector_instant_via_sql(
+            state, scalar, sel, op, return_bool, scalar_on_left, time_us,
+        )
+        .await;
+    }
+
     let left = eval_side_instant(state, lhs, time_us).await?;
     let right = eval_side_instant(state, rhs, time_us).await?;
     Ok(match (left, right) {
@@ -1132,6 +1141,13 @@ async fn binary_range_eval(
     end_us: i64,
     step_us: i64,
 ) -> Result<Vec<RangePoints>, PromError> {
+    if let Some((scalar, sel, scalar_on_left)) = scalar_vector_pair(lhs, rhs) {
+        return scalar_vector_range_via_sql(
+            state, scalar, sel, op, return_bool, scalar_on_left, start_us, end_us,
+        )
+        .await;
+    }
+
     let left = eval_side_range(state, lhs, start_us, end_us, step_us).await?;
     let right = eval_side_range(state, rhs, start_us, end_us, step_us).await?;
     Ok(match (left, right) {
@@ -1213,6 +1229,271 @@ fn apply_scalar_vector_instant(
             }
         })
         .collect()
+}
+
+/// Returns `(scalar, selector, scalar_on_left)` if exactly one side
+/// is a finite `NumberLiteral` and the other is a pure
+/// `VectorSelector`. NaN / Inf scalars fall through to the Rust path
+/// because DataFusion's literal coercion handles them awkwardly.
+fn scalar_vector_pair<'a>(
+    lhs: &'a Expr,
+    rhs: &'a Expr,
+) -> Option<(f64, &'a VectorSelector, bool)> {
+    fn pick_scalar(e: &Expr) -> Option<f64> {
+        if let Expr::NumberLiteral(n) = e {
+            if n.val.is_finite() {
+                return Some(n.val);
+            }
+        }
+        None
+    }
+    if let Some(s) = pick_scalar(lhs) {
+        if let Some(sel) = pure_selector(rhs) {
+            return Some((s, sel, true));
+        }
+    }
+    if let Some(s) = pick_scalar(rhs) {
+        if let Some(sel) = pure_selector(lhs) {
+            return Some((s, sel, false));
+        }
+    }
+    None
+}
+
+/// Float64 SQL literal. `{:?}` always emits a decimal point for
+/// f64, so DataFusion sees `300.0` not `300` (which would parse as
+/// Int and require coercion). We also wrap in `CAST(... AS DOUBLE)`
+/// just to be explicit.
+fn f64_sql_lit(v: f64) -> String {
+    format!("CAST({:?} AS DOUBLE)", v)
+}
+
+fn cmp_op_sql(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Eq => "=",
+        BinOp::Ne => "<>",
+        BinOp::Lt => "<",
+        BinOp::Le => "<=",
+        BinOp::Gt => ">",
+        BinOp::Ge => ">=",
+        // unreachable for arithmetic ops
+        _ => "=",
+    }
+}
+
+/// SQL expression for the *value* result of a binary op. Used for
+/// arithmetic and comparison-with-`bool`. Comparison-without-bool
+/// is the filter form; the caller emits a `WHERE` clause instead.
+fn binop_value_sql(op: BinOp, lhs_sql: &str, rhs_sql: &str, return_bool: bool) -> String {
+    if op.is_comparison() && return_bool {
+        return format!(
+            "CAST(CASE WHEN {lhs_sql} {} {rhs_sql} THEN 1.0 ELSE 0.0 END AS DOUBLE)",
+            cmp_op_sql(op)
+        );
+    }
+    match op {
+        BinOp::Add => format!("({lhs_sql}) + ({rhs_sql})"),
+        BinOp::Sub => format!("({lhs_sql}) - ({rhs_sql})"),
+        BinOp::Mul => format!("({lhs_sql}) * ({rhs_sql})"),
+        BinOp::Div => format!("({lhs_sql}) / ({rhs_sql})"),
+        BinOp::Mod => format!("({lhs_sql}) % ({rhs_sql})"),
+        BinOp::Pow => format!("power(({lhs_sql}), ({rhs_sql}))"),
+        // Comparisons in non-bool mode are unreachable here — they
+        // go down the filter path. Emit `0.0` defensively.
+        _ => "CAST(0.0 AS DOUBLE)".to_string(),
+    }
+}
+
+/// `<scalar> <op> <selector>` (or vice versa) at one timestamp.
+/// Mirrors `apply_scalar_vector_instant`:
+///   - arithmetic / `bool` comparison → recompute value, strip __name__
+///   - filter comparison → keep value, keep __name__, drop rows that
+///     don't match.
+async fn scalar_vector_instant_via_sql(
+    state: &AppState,
+    scalar: f64,
+    sel: &VectorSelector,
+    op: BinOp,
+    return_bool: bool,
+    scalar_on_left: bool,
+    time_us: i64,
+) -> Result<Vec<InstantPoint>, PromError> {
+    let from_us = time_us - LOOKBACK_US;
+    let mut window_conds = selector_predicates(sel);
+    window_conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(from_us),
+        us_to_ts_lit(time_us),
+    ));
+    let window_where = format!(" WHERE {}", window_conds.join(" AND "));
+
+    let scalar_lit = f64_sql_lit(scalar);
+    let (lhs_sql, rhs_sql) = if scalar_on_left {
+        (scalar_lit.as_str(), "l.value")
+    } else {
+        ("l.value", scalar_lit.as_str())
+    };
+
+    let is_filter = op.is_comparison() && !return_bool;
+    let (metric_sel, value_sel, extra_where) = if is_filter {
+        (
+            "s.metric_name".to_string(),
+            "l.value".to_string(),
+            format!(" AND ({lhs_sql} {} {rhs_sql})", cmp_op_sql(op)),
+        )
+    } else {
+        (
+            "''".to_string(),
+            binop_value_sql(op, lhs_sql, rhs_sql, return_bool),
+            String::new(),
+        )
+    };
+
+    let sql = format!(
+        "WITH latest AS ( \
+           SELECT sa.series_id, sa.value, \
+                  ROW_NUMBER() OVER (PARTITION BY sa.series_id ORDER BY sa.timestamp DESC) AS rn \
+           FROM {cat}.skaldberg.samples sa \
+           JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
+           {window_where} \
+         ) \
+         SELECT {metric_sel} AS metric_name, s.labels, ({value_sel}) AS value \
+         FROM latest l \
+         JOIN {cat}.skaldberg.series s ON l.series_id = s.series_id \
+         WHERE l.rn = 1{extra_where}",
+        cat = DF_CATALOG_NAME,
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("scalar-vector sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("scalar-vector collect: {e}")))?;
+
+    let label_filters = label_filters_for_selector(sel);
+    let mut out = Vec::new();
+    for batch in batches {
+        let metric_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| PromError::internal("sv metric_name col"))?;
+        let labels_col = batch.column(1).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("sv labels col"))?;
+        let val_col = batch.column(2).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("sv value col"))?;
+        for i in 0..batch.num_rows() {
+            let labels = labels_to_btree(labels_col, i)?;
+            if !label_filters.iter().all(|f| match_label(&labels, f)) {
+                continue;
+            }
+            out.push(InstantPoint {
+                metric_name: metric_col.value(i).to_string(),
+                labels,
+                ts_us: time_us,
+                value: val_col.value(i),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Range counterpart: every sample in the time window goes through
+/// the same row-level transform / filter, then results are regrouped
+/// by `series_key(metric_name, labels)` so each series's points
+/// stick together.
+async fn scalar_vector_range_via_sql(
+    state: &AppState,
+    scalar: f64,
+    sel: &VectorSelector,
+    op: BinOp,
+    return_bool: bool,
+    scalar_on_left: bool,
+    start_us: i64,
+    end_us: i64,
+) -> Result<Vec<RangePoints>, PromError> {
+    let mut conds = selector_predicates(sel);
+    conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(start_us),
+        us_to_ts_lit(end_us),
+    ));
+    let where_clause = format!(" WHERE {}", conds.join(" AND "));
+
+    let scalar_lit = f64_sql_lit(scalar);
+    let (lhs_sql, rhs_sql) = if scalar_on_left {
+        (scalar_lit.as_str(), "sa.value")
+    } else {
+        ("sa.value", scalar_lit.as_str())
+    };
+
+    let is_filter = op.is_comparison() && !return_bool;
+    let (metric_sel, value_sel, extra_where) = if is_filter {
+        (
+            "s.metric_name".to_string(),
+            "sa.value".to_string(),
+            format!(" AND ({lhs_sql} {} {rhs_sql})", cmp_op_sql(op)),
+        )
+    } else {
+        (
+            "''".to_string(),
+            binop_value_sql(op, lhs_sql, rhs_sql, return_bool),
+            String::new(),
+        )
+    };
+
+    // Output alias is `m_name` (not `metric_name`) so ORDER BY can
+    // reference the qualified `s.metric_name` without colliding
+    // with the projection — the literal-`''` arithmetic case would
+    // otherwise create an unqualified `metric_name` column that
+    // shadows `s.metric_name`.
+    let sql = format!(
+        "SELECT {metric_sel} AS m_name, s.labels, sa.timestamp, ({value_sel}) AS value \
+         FROM {cat}.skaldberg.samples sa \
+         JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
+         {where_clause}{extra_where} \
+         ORDER BY s.metric_name, sa.timestamp",
+        cat = DF_CATALOG_NAME,
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("scalar-vector range sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("scalar-vector range collect: {e}")))?;
+
+    let label_filters = label_filters_for_selector(sel);
+    let mut by_series: BTreeMap<String, RangePoints> = BTreeMap::new();
+    for batch in batches {
+        let metric_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| PromError::internal("sv range metric_name col"))?;
+        let labels_col = batch.column(1).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("sv range labels col"))?;
+        let ts_col = batch.column(2).as_any().downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or_else(|| PromError::internal("sv range ts col"))?;
+        let val_col = batch.column(3).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("sv range value col"))?;
+        for i in 0..batch.num_rows() {
+            let labels = labels_to_btree(labels_col, i)?;
+            if !label_filters.iter().all(|f| match_label(&labels, f)) {
+                continue;
+            }
+            let metric = metric_col.value(i).to_string();
+            let key = series_key(&metric, &labels);
+            let entry = by_series.entry(key).or_insert_with(|| RangePoints {
+                metric_name: metric,
+                labels,
+                points: Vec::new(),
+            });
+            entry.points.push((ts_col.value(i), val_col.value(i)));
+        }
+    }
+    Ok(by_series.into_values().collect())
 }
 
 fn apply_scalar_vector_range(
