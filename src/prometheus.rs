@@ -167,6 +167,19 @@ fn evaluate_instant<'a>(state: &'a AppState, expr: &'a Expr, time_us: i64) -> In
                 modifier,
                 inner,
             }) => {
+                // SQL pushdown is only sound for `by(...)` and "no
+                // modifier"; `without(...)` would need the full label
+                // set up front. The inner expression also has to be a
+                // pure selector — anything richer (rate, binary,
+                // nested aggregation) still goes through the Rust path.
+                if aggregate_can_push_down(modifier) {
+                    if let Some(sel) = pure_selector(inner) {
+                        return instant_aggregate_via_sql(
+                            state, sel, op, modifier, time_us,
+                        )
+                        .await;
+                    }
+                }
                 let inner_pts = evaluate_instant(state, inner, time_us).await?;
                 Ok(aggregate_instant_points(inner_pts, op, modifier, time_us))
             }
@@ -353,6 +366,14 @@ fn evaluate_range<'a>(
                 modifier,
                 inner,
             }) => {
+                if aggregate_can_push_down(modifier) {
+                    if let Some(sel) = pure_selector(inner) {
+                        return range_aggregate_via_sql(
+                            state, sel, op, modifier, start_us, end_us,
+                        )
+                        .await;
+                    }
+                }
                 let inner_series =
                     evaluate_range(state, inner, start_us, end_us, step_us).await?;
                 Ok(aggregate_range_points(inner_series, op, modifier))
@@ -445,6 +466,269 @@ async fn range_range_fn(
         }
     }
     Ok(out)
+}
+
+/// Returns the inner `VectorSelector` if `expr` is a pure selector
+/// (possibly wrapped in parens). Used to decide whether an
+/// aggregation can be pushed straight down into a SQL `GROUP BY`.
+/// Returns `None` for anything that needs in-Rust evaluation (rate,
+/// binary, nested aggregations, etc).
+fn pure_selector(expr: &Expr) -> Option<&VectorSelector> {
+    match expr {
+        Expr::VectorSelector(v) => Some(v),
+        Expr::Paren(p) => pure_selector(p.expr.as_ref()),
+        _ => None,
+    }
+}
+
+/// `by(...)` and "no modifier" can be pushed to SQL — both reduce to
+/// a fixed list of retained label keys (possibly empty). `without(...)`
+/// would need to know every label name in the group at planning
+/// time, which we only learn after reading the data, so it stays
+/// in Rust.
+fn aggregate_can_push_down(modifier: Option<&LabelModifier>) -> bool {
+    matches!(modifier, None | Some(LabelModifier::Include(_)))
+}
+
+/// Retained label keys for a SQL-pushed aggregation. None or
+/// `by(k1, k2)` are the only shapes that reach here.
+fn aggregate_group_keys(modifier: Option<&LabelModifier>) -> Vec<String> {
+    match modifier {
+        Some(LabelModifier::Include(ls)) => ls.labels.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn agg_call_sql(op: AggOp, value_expr: &str) -> String {
+    match op {
+        AggOp::Sum => format!("SUM({value_expr})"),
+        AggOp::Avg => format!("AVG({value_expr})"),
+        AggOp::Min => format!("MIN({value_expr})"),
+        AggOp::Max => format!("MAX({value_expr})"),
+        // `COUNT(*)` returns Int64 in DataFusion; cast it to DOUBLE
+        // so the result column is Float64 like the other aggregators
+        // and our column downcast can stay uniform.
+        AggOp::Count => "CAST(COUNT(*) AS DOUBLE)".to_string(),
+    }
+}
+
+/// Push an `<agg>(<selector>) [by (...)]` instant query into a single
+/// SQL statement that:
+///   - finds the latest sample per series in the lookback window,
+///   - joins to `series` to expose `s.labels`,
+///   - groups by the retained labels (or globally) and aggregates.
+async fn instant_aggregate_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    op: AggOp,
+    modifier: Option<&LabelModifier>,
+    time_us: i64,
+) -> Result<Vec<InstantPoint>, PromError> {
+    let from_us = time_us - LOOKBACK_US;
+    let group_keys = aggregate_group_keys(modifier);
+
+    let mut window_conds = selector_predicates(sel);
+    window_conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(from_us),
+        us_to_ts_lit(time_us),
+    ));
+    let window_where = format!(" WHERE {}", window_conds.join(" AND "));
+
+    let label_exprs: Vec<String> = group_keys
+        .iter()
+        .map(|k| format!("element_at(s.labels, '{}')[1]", sql_escape(k)))
+        .collect();
+
+    let select_label_part = if label_exprs.is_empty() {
+        String::new()
+    } else {
+        let mut parts: Vec<String> = Vec::with_capacity(label_exprs.len());
+        for (i, e) in label_exprs.iter().enumerate() {
+            parts.push(format!("{e} AS lbl_{i}"));
+        }
+        format!("{}, ", parts.join(", "))
+    };
+
+    let group_by_clause = if label_exprs.is_empty() {
+        String::new()
+    } else {
+        format!(" GROUP BY {}", label_exprs.join(", "))
+    };
+
+    let agg_call = agg_call_sql(op, "ws.value");
+
+    // ROW_NUMBER over series_id picks the latest sample per series
+    // within the lookback window. The selector predicates live in
+    // the CTE so we don't compute row-numbers for series we'll just
+    // throw away.
+    let sql = format!(
+        "WITH ws AS ( \
+           SELECT sa.series_id, sa.value, sa.timestamp, \
+                  ROW_NUMBER() OVER (PARTITION BY sa.series_id ORDER BY sa.timestamp DESC) AS rn \
+           FROM {cat}.skaldberg.samples sa \
+           JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
+           {window_where} \
+         ) \
+         SELECT {select_label_part}{agg_call} AS agg_v \
+         FROM ws \
+         JOIN {cat}.skaldberg.series s ON ws.series_id = s.series_id \
+         WHERE ws.rn = 1\
+         {group_by_clause}",
+        cat = DF_CATALOG_NAME,
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("aggregate sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("aggregate collect: {e}")))?;
+
+    let mut out = Vec::new();
+    for batch in batches {
+        let label_count = group_keys.len();
+        let agg_col = batch
+            .column(label_count)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("aggregate value not Float64"))?;
+        // Each label column is StringArray (NULL when the series
+        // didn't carry that label — collapses into the "missing"
+        // group, matching Prometheus's behavior).
+        let mut label_arrays: Vec<&StringArray> = Vec::with_capacity(label_count);
+        for li in 0..label_count {
+            let arr = batch.column(li).as_any().downcast_ref::<StringArray>()
+                .ok_or_else(|| PromError::internal("aggregate label col not Utf8"))?;
+            label_arrays.push(arr);
+        }
+        for i in 0..batch.num_rows() {
+            if agg_col.is_null(i) {
+                continue;
+            }
+            let mut labels = BTreeMap::new();
+            for (li, key) in group_keys.iter().enumerate() {
+                if !label_arrays[li].is_null(i) {
+                    labels.insert(key.clone(), label_arrays[li].value(i).to_string());
+                }
+            }
+            out.push(InstantPoint {
+                metric_name: String::new(),
+                labels,
+                ts_us: time_us,
+                value: agg_col.value(i),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Range counterpart: per-timestamp SQL `GROUP BY` over the
+/// retained labels. No CTE / window function needed since we want
+/// every sample's contribution per timestamp.
+async fn range_aggregate_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    op: AggOp,
+    modifier: Option<&LabelModifier>,
+    start_us: i64,
+    end_us: i64,
+) -> Result<Vec<RangePoints>, PromError> {
+    let group_keys = aggregate_group_keys(modifier);
+
+    let mut conds = selector_predicates(sel);
+    conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(start_us),
+        us_to_ts_lit(end_us),
+    ));
+    let where_clause = format!(" WHERE {}", conds.join(" AND "));
+
+    let label_exprs: Vec<String> = group_keys
+        .iter()
+        .map(|k| format!("element_at(s.labels, '{}')[1]", sql_escape(k)))
+        .collect();
+    let select_label_part = if label_exprs.is_empty() {
+        String::new()
+    } else {
+        let mut parts: Vec<String> = Vec::with_capacity(label_exprs.len());
+        for (i, e) in label_exprs.iter().enumerate() {
+            parts.push(format!("{e} AS lbl_{i}"));
+        }
+        format!("{}, ", parts.join(", "))
+    };
+    let mut group_cols = vec!["sa.timestamp".to_string()];
+    group_cols.extend(label_exprs.iter().cloned());
+    let group_by_clause = format!(" GROUP BY {}", group_cols.join(", "));
+    let mut order_cols = label_exprs.clone();
+    order_cols.push("sa.timestamp".to_string());
+    let order_by_clause = format!(" ORDER BY {}", order_cols.join(", "));
+
+    let agg_call = agg_call_sql(op, "sa.value");
+
+    let sql = format!(
+        "SELECT sa.timestamp, {select_label_part}{agg_call} AS agg_v \
+         FROM {cat}.skaldberg.samples sa \
+         JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
+         {where_clause}\
+         {group_by_clause}\
+         {order_by_clause}",
+        cat = DF_CATALOG_NAME,
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("range aggregate sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("range aggregate collect: {e}")))?;
+
+    let mut by_group: BTreeMap<BTreeMap<String, String>, Vec<(i64, f64)>> = BTreeMap::new();
+    for batch in batches {
+        let label_count = group_keys.len();
+        let ts_col = batch.column(0).as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or_else(|| PromError::internal("aggregate ts col not Timestamp(us)"))?;
+        let agg_col = batch.column(1 + label_count).as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("aggregate value col not Float64"))?;
+        let mut label_arrays: Vec<&StringArray> = Vec::with_capacity(label_count);
+        for li in 0..label_count {
+            let arr = batch.column(1 + li).as_any().downcast_ref::<StringArray>()
+                .ok_or_else(|| PromError::internal("aggregate label col not Utf8"))?;
+            label_arrays.push(arr);
+        }
+        for i in 0..batch.num_rows() {
+            if agg_col.is_null(i) {
+                continue;
+            }
+            let mut labels = BTreeMap::new();
+            for (li, key) in group_keys.iter().enumerate() {
+                if !label_arrays[li].is_null(i) {
+                    labels.insert(key.clone(), label_arrays[li].value(i).to_string());
+                }
+            }
+            by_group
+                .entry(labels)
+                .or_default()
+                .push((ts_col.value(i), agg_col.value(i)));
+        }
+    }
+    Ok(by_group
+        .into_iter()
+        .filter(|(_, pts)| !pts.is_empty())
+        .map(|(labels, points)| RangePoints {
+            metric_name: String::new(),
+            labels,
+            points,
+        })
+        .collect())
 }
 
 /// Group input series by retained labels, align by timestamp, then
@@ -1596,40 +1880,7 @@ async fn run_selector_query(
     from_us: i64,
     to_us: i64,
 ) -> Result<Vec<SeriesRow>, PromError> {
-    // SQL filters: metric_name, time window, and any label matcher
-    // we can push down via the `map_get_string` UDF (= and !=).
-    // Regex matchers stay in Rust below — DataFusion's regexp_match
-    // would need a slightly different rewrite.
-    let mut conds = Vec::new();
-    if let Some(name) = effective_metric_name(sel) {
-        conds.push(format!("s.metric_name = '{}'", sql_escape(&name)));
-    }
-    // DataFusion 52's `element_at(map, key)` returns `List<Utf8>`,
-    // which won't compare against a `Utf8` directly. Index it with
-    // `[1]` (List indexing is 1-based) to drop down to a scalar
-    // `Utf8` we can equate. A missing key yields NULL, which
-    // `COALESCE(..., '')` turns into the empty string for the
-    // PromQL `!=` semantics ("missing label is empty").
-    for m in &sel.matchers.matchers {
-        if m.name == "__name__" {
-            continue;
-        }
-        let key = sql_escape(&m.name);
-        let val = sql_escape(&m.value);
-        match &m.op {
-            MatchOp::Equal => {
-                conds.push(format!("element_at(s.labels, '{key}')[1] = '{val}'"));
-            }
-            MatchOp::NotEqual => {
-                conds.push(format!(
-                    "COALESCE(element_at(s.labels, '{key}')[1], '') != '{val}'"
-                ));
-            }
-            MatchOp::Re(_) | MatchOp::NotRe(_) => {
-                // Pushed down to Rust below.
-            }
-        }
-    }
+    let mut conds = selector_predicates(sel);
     conds.push(format!(
         "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
         us_to_ts_lit(from_us),
@@ -1691,6 +1942,44 @@ async fn run_selector_query(
         }
     }
     Ok(rows)
+}
+
+/// SQL `WHERE` predicates derived from a vector selector. Returns
+/// conditions assuming the `series` table is aliased as `s` and the
+/// `samples` table as `sa`. Doesn't include the time-range clause —
+/// callers add that on top so they can decide which timestamp
+/// column to gate on.
+///
+/// `=` / `!=` matchers go through `element_at(s.labels, '<k>')[1]`
+/// (List<Utf8> indexing collapses to Utf8). Regex matchers are
+/// dropped here and applied as a Rust post-filter — DataFusion 52
+/// doesn't expose a clean regexp pushdown for label maps.
+fn selector_predicates(sel: &VectorSelector) -> Vec<String> {
+    let mut conds = Vec::new();
+    if let Some(name) = effective_metric_name(sel) {
+        conds.push(format!("s.metric_name = '{}'", sql_escape(&name)));
+    }
+    for m in &sel.matchers.matchers {
+        if m.name == "__name__" {
+            continue;
+        }
+        let key = sql_escape(&m.name);
+        let val = sql_escape(&m.value);
+        match &m.op {
+            MatchOp::Equal => {
+                conds.push(format!("element_at(s.labels, '{key}')[1] = '{val}'"));
+            }
+            MatchOp::NotEqual => {
+                conds.push(format!(
+                    "COALESCE(element_at(s.labels, '{key}')[1], '') != '{val}'"
+                ));
+            }
+            MatchOp::Re(_) | MatchOp::NotRe(_) => {
+                // Pushed down to Rust post-filter.
+            }
+        }
+    }
+    conds
 }
 
 /// Resolve the metric name from a vector selector.
