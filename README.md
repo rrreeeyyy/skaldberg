@@ -1,6 +1,7 @@
 # Skaldberg
 
-A small, cloud-native time-series database backed by Apache Iceberg.
+A cloud-native, operation-less, cost-effective time-series database
+backed by AWS S3 Tables (Apache Iceberg).
 
 Status: **Phase 8 (PromQL → SQL pushdown over S3 Tables).** Storage is
 Apache Iceberg tables on AWS S3 Tables (or an in-process MemoryCatalog
