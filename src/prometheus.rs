@@ -161,7 +161,7 @@ fn evaluate_instant<'a>(state: &'a AppState, expr: &'a Expr, time_us: i64) -> In
                 sel,
                 range_us,
                 op,
-            }) => instant_range_fn(state, sel, range_us, op, time_us).await,
+            }) => instant_range_fn_via_sql(state, sel, range_us, op, time_us).await,
             Some(QueryKind::Aggregate {
                 op,
                 modifier,
@@ -248,7 +248,16 @@ async fn instant_selector(
         .collect())
 }
 
-async fn instant_range_fn(
+/// `rate(m[r])` / `irate(...)` / `increase(...)` / `delta(...)` at a
+/// single instant timestamp, evaluated as one SQL plan.
+///
+/// Window: `[t - r, t]` (closed-closed; matches the existing Rust
+/// path's `partition_point` behavior). Counter-reset adjustment for
+/// rate/irate/increase replicates `delta_with_reset_and_secs`:
+/// adjacent pairs sum positive deltas and treat each drop as the
+/// raw current value (the underlying counter is assumed to have
+/// gone `0 → curr` across the gap).
+async fn instant_range_fn_via_sql(
     state: &AppState,
     sel: &VectorSelector,
     range_us: i64,
@@ -256,14 +265,51 @@ async fn instant_range_fn(
     time_us: i64,
 ) -> Result<Vec<InstantPoint>, PromError> {
     let from_us = time_us - range_us;
-    let rows = run_selector_query(state, sel, from_us, time_us).await?;
-    let by_series = group_rows_by_series(rows);
+    let mut conds = selector_predicates(sel);
+    conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(from_us),
+        us_to_ts_lit(time_us),
+    ));
+    let where_clause = format!("WHERE {}", conds.join(" AND "));
+
+    let sql = build_range_fn_sql(op, &where_clause);
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("range_fn sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("range_fn collect: {e}")))?;
+
+    let label_filters = label_filters_for_selector(sel);
     let mut out = Vec::new();
-    for (_, (metric_name, labels, mut points)) in by_series {
-        points.sort_by_key(|(t, _)| *t);
-        if let Some(v) = compute_range_fn(&points, op) {
+    for batch in batches {
+        let metric_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| PromError::internal("rate metric_name col"))?;
+        let labels_col = batch.column(1).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("rate labels col"))?;
+        let val_col = batch.column(2).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("rate value col"))?;
+        for i in 0..batch.num_rows() {
+            let labels = labels_to_btree(labels_col, i)?;
+            if !label_filters.iter().all(|f| match_label(&labels, f)) {
+                continue;
+            }
+            // SUM may yield NULL on empty groups (filtered by HAVING /
+            // WHERE upstream) and Float64 division could in principle
+            // produce NaN; drop those rather than propagate.
+            if val_col.is_null(i) {
+                continue;
+            }
+            let v = val_col.value(i);
+            if !v.is_finite() {
+                continue;
+            }
             out.push(InstantPoint {
-                metric_name,
+                metric_name: metric_col.value(i).to_string(),
                 labels,
                 ts_us: time_us,
                 value: v,
@@ -271,6 +317,137 @@ async fn instant_range_fn(
         }
     }
     Ok(out)
+}
+
+/// Build the SQL plan for an instant range-function call.
+///
+/// Three shapes:
+///   - rate / increase: `LAG()` per series + `SUM(reset-adjusted dv)`,
+///     final value = `total_delta * 1e6 / (last_us - first_us)` for
+///     rate, `total_delta` for increase.
+///   - irate: take the latest two samples per series via
+///     `ROW_NUMBER() ... DESC`, compute `(curr - prev)/secs` with
+///     reset adjustment.
+///   - delta: gauge difference, `last_v - first_v`. No reset
+///     adjustment (use `increase` for counters).
+///
+/// All three require ≥2 samples in the window and a positive
+/// timestamp span; they emit nothing for series that don't qualify.
+fn build_range_fn_sql(op: RangeFnOp, where_clause: &str) -> String {
+    let cat = DF_CATALOG_NAME;
+    match op {
+        RangeFnOp::Rate | RangeFnOp::Increase => {
+            let value_expr = if matches!(op, RangeFnOp::Rate) {
+                "total_delta * 1000000.0 / (last_ts_us - first_ts_us)"
+            } else {
+                "total_delta"
+            };
+            // `base` re-projects sa.value as `value + 0.0` and the
+            // timestamp through `CAST(... AS BIGINT)` so the resulting
+            // columns lose the Parquet `field_id` metadata. Without
+            // this DataFusion 52's `LAG()` planner trips a logical-vs-
+            // physical schema mismatch (apache/datafusion#…) when the
+            // window input still carries the original Parquet metadata.
+            format!(
+                "WITH base AS ( \
+                   SELECT sa.series_id, \
+                          CAST(sa.timestamp AS BIGINT) AS ts_us, \
+                          sa.value + 0.0 AS value \
+                   FROM {cat}.skaldberg.samples sa \
+                   JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
+                   {where_clause} \
+                 ), \
+                 adjusted AS ( \
+                   SELECT series_id, ts_us, value, \
+                          LAG(value) OVER w AS prev_v \
+                   FROM base \
+                   WINDOW w AS (PARTITION BY series_id ORDER BY ts_us) \
+                 ), \
+                 agg AS ( \
+                   SELECT series_id, \
+                          SUM(CASE \
+                                WHEN prev_v IS NULL THEN CAST(0.0 AS DOUBLE) \
+                                WHEN value >= prev_v THEN value - prev_v \
+                                ELSE value \
+                              END) AS total_delta, \
+                          MAX(ts_us) AS last_ts_us, \
+                          MIN(ts_us) AS first_ts_us, \
+                          COUNT(*) AS n \
+                   FROM adjusted \
+                   GROUP BY series_id \
+                 ) \
+                 SELECT s.metric_name, s.labels, ({value_expr}) AS v \
+                 FROM agg a \
+                 JOIN {cat}.skaldberg.series s ON a.series_id = s.series_id \
+                 WHERE a.n >= 2 AND a.last_ts_us > a.first_ts_us"
+            )
+        }
+        RangeFnOp::Irate => {
+            // Pick rn_desc=1 (the latest sample) and pair it with
+            // the immediately preceding sample via `LAG()` — that's
+            // already the "prev" by construction since LAG is over
+            // ASC ordering. total_n ≥ 2 guarantees prev exists.
+            // `base` strips Parquet field metadata (see Rate path).
+            format!(
+                "WITH base AS ( \
+                   SELECT sa.series_id, \
+                          CAST(sa.timestamp AS BIGINT) AS ts_us, \
+                          sa.value + 0.0 AS value \
+                   FROM {cat}.skaldberg.samples sa \
+                   JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
+                   {where_clause} \
+                 ), \
+                 ranked AS ( \
+                   SELECT series_id, ts_us, value, \
+                          LAG(value) OVER w AS prev_v, \
+                          LAG(ts_us) OVER w AS prev_ts_us, \
+                          ROW_NUMBER() OVER (PARTITION BY series_id ORDER BY ts_us DESC) AS rn_desc, \
+                          COUNT(*) OVER (PARTITION BY series_id) AS total_n \
+                   FROM base \
+                   WINDOW w AS (PARTITION BY series_id ORDER BY ts_us) \
+                 ) \
+                 SELECT s.metric_name, s.labels, \
+                        ((CASE WHEN value >= prev_v THEN value - prev_v ELSE value END) * 1000000.0 / (ts_us - prev_ts_us)) AS v \
+                 FROM ranked r \
+                 JOIN {cat}.skaldberg.series s ON r.series_id = s.series_id \
+                 WHERE r.rn_desc = 1 AND r.total_n >= 2 AND r.ts_us > r.prev_ts_us"
+            )
+        }
+        RangeFnOp::Delta => {
+            // Two ROW_NUMBER passes per partition: ASC for the first
+            // sample, DESC for the last. Join the two sides on
+            // series_id and subtract. `base` strips Parquet field
+            // metadata so window functions plan cleanly.
+            format!(
+                "WITH base AS ( \
+                   SELECT sa.series_id, \
+                          CAST(sa.timestamp AS BIGINT) AS ts_us, \
+                          sa.value + 0.0 AS value \
+                   FROM {cat}.skaldberg.samples sa \
+                   JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
+                   {where_clause} \
+                 ), \
+                 ranked AS ( \
+                   SELECT series_id, value, \
+                          ROW_NUMBER() OVER (PARTITION BY series_id ORDER BY ts_us ASC) AS rn_asc, \
+                          ROW_NUMBER() OVER (PARTITION BY series_id ORDER BY ts_us DESC) AS rn_desc, \
+                          COUNT(*) OVER (PARTITION BY series_id) AS total_n \
+                   FROM base \
+                 ), \
+                 endpoints AS ( \
+                   SELECT series_id, value AS first_v, total_n FROM ranked WHERE rn_asc = 1 \
+                 ), \
+                 last_v AS ( \
+                   SELECT series_id, value AS last_val FROM ranked WHERE rn_desc = 1 \
+                 ) \
+                 SELECT s.metric_name, s.labels, (l.last_val - e.first_v) AS v \
+                 FROM endpoints e \
+                 JOIN last_v l ON e.series_id = l.series_id \
+                 JOIN {cat}.skaldberg.series s ON e.series_id = s.series_id \
+                 WHERE e.total_n >= 2"
+            )
+        }
+    }
 }
 
 /// Group instant points by retained labels, then collapse with `op`.
