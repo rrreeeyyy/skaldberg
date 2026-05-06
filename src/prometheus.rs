@@ -167,6 +167,10 @@ fn evaluate_instant<'a>(state: &'a AppState, expr: &'a Expr, time_us: i64) -> In
                 let inner_pts = evaluate_instant(state, inner, time_us).await?;
                 Ok(aggregate_instant_points(inner_pts, op, modifier, time_us))
             }
+            Some(QueryKind::HistogramQuantile { quantile, inner }) => {
+                let inner_pts = evaluate_instant(state, inner, time_us).await?;
+                Ok(histogram_quantile_instant(inner_pts, quantile, time_us))
+            }
             None => Ok(vec![]),
         }
     })
@@ -335,6 +339,11 @@ fn evaluate_range<'a>(
                     evaluate_range(state, inner, start_us, end_us, step_us).await?;
                 Ok(aggregate_range_points(inner_series, op, modifier))
             }
+            Some(QueryKind::HistogramQuantile { quantile, inner }) => {
+                let inner_series =
+                    evaluate_range(state, inner, start_us, end_us, step_us).await?;
+                Ok(histogram_quantile_range(inner_series, quantile))
+            }
             None => Ok(vec![]),
         }
     })
@@ -436,6 +445,150 @@ fn aggregate_range_points(
         }
     }
     out
+}
+
+/// Reduce a vector of histogram-bucket points (each carrying an
+/// `le="..."` label) to a single quantile value per `(label-set
+/// excluding le)` group. Mirrors Prometheus's `histogram_quantile`
+/// algorithm without the recent native histogram extensions.
+fn histogram_quantile_instant(
+    inner: Vec<InstantPoint>,
+    quantile: f64,
+    time_us: i64,
+) -> Vec<InstantPoint> {
+    // Group by every label except `le`. Inside each group we sort
+    // bucket boundaries and walk the cumulative counts.
+    let mut groups: BTreeMap<BTreeMap<String, String>, Vec<(f64, f64)>> = BTreeMap::new();
+    for p in inner {
+        let mut labels = p.labels;
+        let le = match labels.remove("le").as_deref().and_then(parse_le) {
+            Some(v) => v,
+            None => continue, // not a histogram bucket — drop
+        };
+        groups.entry(labels).or_default().push((le, p.value));
+    }
+    let mut out = Vec::new();
+    for (labels, mut buckets) in groups {
+        buckets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(v) = quantile_from_buckets(&buckets, quantile) {
+            out.push(InstantPoint {
+                metric_name: String::new(),
+                labels,
+                ts_us: time_us,
+                value: v,
+            });
+        }
+    }
+    out
+}
+
+fn histogram_quantile_range(inner: Vec<RangePoints>, quantile: f64) -> Vec<RangePoints> {
+    // ts → bucket vec, scoped per `(labels minus le)` group. We need
+    // the timestamps aligned across `le` siblings to compute a
+    // quantile per timestep, so build a `group → ts → buckets` map
+    // first, then compute per-ts quantile per group.
+    let mut groups: BTreeMap<BTreeMap<String, String>, BTreeMap<i64, Vec<(f64, f64)>>> =
+        BTreeMap::new();
+    for series in inner {
+        let mut labels = series.labels;
+        let le = match labels.remove("le").as_deref().and_then(parse_le) {
+            Some(v) => v,
+            None => continue,
+        };
+        let group_buckets = groups.entry(labels).or_default();
+        for (ts, v) in series.points {
+            group_buckets.entry(ts).or_default().push((le, v));
+        }
+    }
+    let mut out = Vec::new();
+    for (labels, ts_buckets) in groups {
+        let mut points = Vec::new();
+        for (ts, mut buckets) in ts_buckets {
+            buckets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some(v) = quantile_from_buckets(&buckets, quantile) {
+                points.push((ts, v));
+            }
+        }
+        if !points.is_empty() {
+            out.push(RangePoints {
+                metric_name: String::new(),
+                labels,
+                points,
+            });
+        }
+    }
+    out
+}
+
+fn parse_le(s: &str) -> Option<f64> {
+    if s.eq_ignore_ascii_case("+inf") || s.eq_ignore_ascii_case("inf") {
+        Some(f64::INFINITY)
+    } else if s.eq_ignore_ascii_case("-inf") {
+        Some(f64::NEG_INFINITY)
+    } else {
+        s.parse::<f64>().ok()
+    }
+}
+
+/// Linear interpolation across a Prometheus cumulative histogram.
+///
+/// `buckets` is `[(le, cumulative_count)]` sorted by `le` ascending.
+/// The last bucket is expected to be `le=+Inf` and carries the total
+/// count. `q` is the requested quantile in `[0, 1]`.
+///
+/// For `q ≤ 0` we return the lowest non-empty bucket boundary, for
+/// `q ≥ 1` the largest finite boundary observed. Otherwise we find
+/// the bucket whose cumulative count first crosses `q * total` and
+/// linearly interpolate between its lower and upper `le` bounds. If
+/// the crossing bucket has unbounded upper edge (`+Inf`) we return
+/// the previous boundary instead of trying to interpolate to
+/// infinity.
+fn quantile_from_buckets(buckets: &[(f64, f64)], q: f64) -> Option<f64> {
+    if buckets.len() < 2 {
+        return None;
+    }
+    let total = buckets.last()?.1;
+    if total <= 0.0 || q.is_nan() {
+        return None;
+    }
+    if q <= 0.0 {
+        // Smallest le boundary that has any count.
+        for &(le, count) in buckets {
+            if count > 0.0 {
+                return Some(le);
+            }
+        }
+        return None;
+    }
+    if q >= 1.0 {
+        // Largest finite le boundary observed.
+        for &(le, _) in buckets.iter().rev() {
+            if le.is_finite() {
+                return Some(le);
+            }
+        }
+        return None;
+    }
+
+    let target = q * total;
+    let mut lower_le = 0.0_f64;
+    let mut lower_count = 0.0_f64;
+    for &(le, count) in buckets {
+        if count >= target {
+            if le.is_infinite() {
+                return Some(lower_le);
+            }
+            let bucket_count = count - lower_count;
+            if bucket_count <= 0.0 {
+                return Some(le);
+            }
+            let frac = (target - lower_count) / bucket_count;
+            return Some(lower_le + frac * (le - lower_le));
+        }
+        lower_le = le;
+        lower_count = count;
+    }
+    None
 }
 
 fn range_points_to_json(series: Vec<RangePoints>) -> Vec<JsonValue> {
@@ -773,6 +926,10 @@ enum QueryKind<'a> {
         modifier: Option<&'a LabelModifier>,
         inner: &'a Expr,
     },
+    /// `histogram_quantile(q, vector)` — interpolate a quantile out
+    /// of a Prometheus histogram (cumulative `_bucket` series with
+    /// `le="..."` labels).
+    HistogramQuantile { quantile: f64, inner: &'a Expr },
 }
 
 #[derive(Clone, Copy)]
@@ -815,6 +972,14 @@ fn detect_query_kind(expr: &Expr) -> Option<QueryKind<'_>> {
         // through to selector unwrap so the panel still draws something.
     }
     if let Expr::Call(c) = expr {
+        if c.func.name.eq_ignore_ascii_case("histogram_quantile") && c.args.args.len() == 2 {
+            if let Expr::NumberLiteral(num) = c.args.args[0].as_ref() {
+                return Some(QueryKind::HistogramQuantile {
+                    quantile: num.val,
+                    inner: c.args.args[1].as_ref(),
+                });
+            }
+        }
         if let Some(op) = parse_range_fn_op(&c.func.name) {
             if let Some(arg) = c.args.args.first() {
                 if let Expr::MatrixSelector(m) = arg.as_ref() {
