@@ -224,15 +224,27 @@ fn evaluate_instant<'a>(state: &'a AppState, expr: &'a Expr, time_us: i64) -> In
                 modifier,
                 inner,
             }) => {
-                // Same pushdown criteria as `Aggregate`: pure selector
-                // inner + None / `by(...)` modifier. `without(...)`
-                // would need the full label set up front, and a
-                // non-selector inner (e.g. `topk(3, rate(m[1m]))`)
-                // still goes through the Rust path.
+                // Same pushdown criteria as `Aggregate`: `by(...)` /
+                // no modifier. `without(...)` would need the full
+                // label set up front and stays on the Rust path.
                 if aggregate_can_push_down(modifier) {
                     if let Some(sel) = pure_selector(inner) {
                         return instant_topk_via_sql(
                             state, sel, n, top, modifier, time_us,
+                        )
+                        .await;
+                    }
+                    // Two-step: `topk(n, <rate-fn>(<selector>[r]))`.
+                    // Reuse the per-series rate CTE chain and rank by
+                    // `rate_v` instead of the latest sample.
+                    if let Some(QueryKind::RangeFn {
+                        sel,
+                        range_us,
+                        op: fn_op,
+                    }) = detect_query_kind(inner)
+                    {
+                        return instant_topk_over_rangefn_via_sql(
+                            state, sel, range_us, fn_op, n, top, modifier, time_us,
                         )
                         .await;
                     }
@@ -1460,6 +1472,18 @@ fn evaluate_range<'a>(
                         )
                         .await;
                     }
+                    if let Some(QueryKind::RangeFn {
+                        sel,
+                        range_us,
+                        op: fn_op,
+                    }) = detect_query_kind(inner)
+                    {
+                        return range_topk_over_rangefn_via_sql(
+                            state, sel, range_us, fn_op, n, top, modifier,
+                            start_us, end_us, step_us,
+                        )
+                        .await;
+                    }
                 }
                 let inner_series =
                     evaluate_range(state, inner, start_us, end_us, step_us).await?;
@@ -1868,6 +1892,104 @@ async fn instant_topk_via_sql(
     Ok(out)
 }
 
+/// `topk(n, <rate-fn>(<selector>[r])) [by (...)]` evaluated as
+/// one SQL plan: per-series rate produced by
+/// `per_series_rangefn_ctes`, then `ROW_NUMBER` partitioned by
+/// the retained labels and ordered by `rate_v` DESC (topk) or ASC
+/// (bottomk). Surviving rows keep their full `metric_name` and
+/// label MAP because topk is a filter, not a reduction.
+async fn instant_topk_over_rangefn_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    range_us: i64,
+    fn_op: RangeFnOp,
+    n: usize,
+    top: bool,
+    modifier: Option<&LabelModifier>,
+    time_us: i64,
+) -> Result<Vec<InstantPoint>, PromError> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let from_us = time_us - range_us;
+    let mut conds = selector_predicates(sel);
+    conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(from_us),
+        us_to_ts_lit(time_us),
+    ));
+    let where_clause = format!("WHERE {}", conds.join(" AND "));
+    let rate_ctes = per_series_rangefn_ctes(fn_op, &where_clause);
+
+    let group_keys = aggregate_group_keys(modifier);
+    let label_exprs: Vec<String> = group_keys
+        .iter()
+        .map(|k| format!("element_at(s.labels, '{}')[1]", sql_escape(k)))
+        .collect();
+    let partition_clause = if label_exprs.is_empty() {
+        String::new()
+    } else {
+        format!("PARTITION BY {} ", label_exprs.join(", "))
+    };
+    let order_dir = if top { "DESC" } else { "ASC" };
+    let cat = DF_CATALOG_NAME;
+
+    let sql = format!(
+        "{rate_ctes}, \
+         ranked AS ( \
+           SELECT ps.series_id, ps.rate_v, \
+                  ROW_NUMBER() OVER ({partition_clause}ORDER BY ps.rate_v {order_dir}) AS rnk \
+           FROM per_series ps \
+           JOIN {cat}.skaldberg.series s ON ps.series_id = s.series_id \
+         ) \
+         SELECT s.metric_name, s.labels, rk.rate_v AS value \
+         FROM ranked rk \
+         JOIN {cat}.skaldberg.series s ON rk.series_id = s.series_id \
+         WHERE rk.rnk <= {n}"
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("topk-over-rate sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("topk-over-rate collect: {e}")))?;
+
+    let label_filters = label_filters_for_selector(sel);
+    let mut out = Vec::new();
+    for batch in batches {
+        let metric_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| PromError::internal("topk-over-rate metric_name col"))?;
+        let labels_col = batch.column(1).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("topk-over-rate labels col"))?;
+        let val_col = batch.column(2).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("topk-over-rate value col"))?;
+        for i in 0..batch.num_rows() {
+            let labels = labels_to_btree(labels_col, i)?;
+            if !label_filters.iter().all(|f| match_label(&labels, f)) {
+                continue;
+            }
+            if val_col.is_null(i) {
+                continue;
+            }
+            let v = val_col.value(i);
+            if !v.is_finite() {
+                continue;
+            }
+            out.push(InstantPoint {
+                metric_name: metric_col.value(i).to_string(),
+                labels,
+                ts_us: time_us,
+                value: v,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Range counterpart: rank within `(timestamp, retained_labels)`
 /// instead of just retained_labels, so each evaluation timestamp
 /// gets its own top-n cut. Output rows are regrouped on the Rust
@@ -1954,6 +2076,130 @@ async fn range_topk_via_sql(
                 points: Vec::new(),
             });
             entry.points.push((ts_col.value(i), val_col.value(i)));
+        }
+    }
+    Ok(by_series.into_values().collect())
+}
+
+/// Matrix `topk(n, <rate-fn>(<selector>[r])) [by (...)]`. Per-eval
+/// per-series rate from `per_series_rangefn_range_ctes`, then
+/// `ROW_NUMBER` partitioned by `(eval_us, retained_labels)` so
+/// each evaluation timestamp gets its own top-n cut.
+async fn range_topk_over_rangefn_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    range_us: i64,
+    fn_op: RangeFnOp,
+    n: usize,
+    top: bool,
+    modifier: Option<&LabelModifier>,
+    start_us: i64,
+    end_us: i64,
+    step_us: i64,
+) -> Result<Vec<RangePoints>, PromError> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let mut evals = Vec::new();
+    let mut t = start_us;
+    while t <= end_us {
+        evals.push(t);
+        if evals.len() > MAX_RANGE_EVALS {
+            return Err(PromError::bad_data(format!(
+                "range query produces > {MAX_RANGE_EVALS} eval points; pick a larger step"
+            )));
+        }
+        t = t.saturating_add(step_us);
+    }
+    if evals.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let global_lo = start_us.saturating_sub(range_us);
+    let mut sample_conds = selector_predicates(sel);
+    sample_conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(global_lo),
+        us_to_ts_lit(end_us),
+    ));
+    let sample_where = sample_conds.join(" AND ");
+
+    let mut values_parts = Vec::with_capacity(evals.len());
+    for v in &evals {
+        values_parts.push(format!("({v})"));
+    }
+    let values_clause = values_parts.join(", ");
+
+    let rate_ctes = per_series_rangefn_range_ctes(fn_op, range_us, &values_clause, &sample_where);
+
+    let group_keys = aggregate_group_keys(modifier);
+    let label_exprs: Vec<String> = group_keys
+        .iter()
+        .map(|k| format!("element_at(s.labels, '{}')[1]", sql_escape(k)))
+        .collect();
+    let mut partition_cols = vec!["ps.eval_us".to_string()];
+    partition_cols.extend(label_exprs.iter().cloned());
+    let partition_clause = format!("PARTITION BY {} ", partition_cols.join(", "));
+    let order_dir = if top { "DESC" } else { "ASC" };
+    let cat = DF_CATALOG_NAME;
+
+    let sql = format!(
+        "{rate_ctes}, \
+         ranked AS ( \
+           SELECT ps.series_id, ps.eval_us, ps.rate_v, \
+                  ROW_NUMBER() OVER ({partition_clause}ORDER BY ps.rate_v {order_dir}) AS rnk \
+           FROM per_series ps \
+           JOIN {cat}.skaldberg.series s ON ps.series_id = s.series_id \
+         ) \
+         SELECT s.metric_name, s.labels, rk.eval_us, rk.rate_v AS value \
+         FROM ranked rk \
+         JOIN {cat}.skaldberg.series s ON rk.series_id = s.series_id \
+         WHERE rk.rnk <= {n} \
+         ORDER BY s.metric_name, rk.eval_us"
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("range topk-over-rate sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("range topk-over-rate collect: {e}")))?;
+
+    use arrow::array::Int64Array;
+    let label_filters = label_filters_for_selector(sel);
+    let mut by_series: BTreeMap<String, RangePoints> = BTreeMap::new();
+    for batch in batches {
+        let metric_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| PromError::internal("range topk-over-rate metric_name col"))?;
+        let labels_col = batch.column(1).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("range topk-over-rate labels col"))?;
+        let eval_col = batch.column(2).as_any().downcast_ref::<Int64Array>()
+            .ok_or_else(|| PromError::internal("range topk-over-rate eval_us col"))?;
+        let val_col = batch.column(3).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("range topk-over-rate value col"))?;
+        for i in 0..batch.num_rows() {
+            let labels = labels_to_btree(labels_col, i)?;
+            if !label_filters.iter().all(|f| match_label(&labels, f)) {
+                continue;
+            }
+            if val_col.is_null(i) {
+                continue;
+            }
+            let v = val_col.value(i);
+            if !v.is_finite() {
+                continue;
+            }
+            let metric = metric_col.value(i).to_string();
+            let key = series_key(&metric, &labels);
+            let entry = by_series.entry(key).or_insert_with(|| RangePoints {
+                metric_name: metric,
+                labels,
+                points: Vec::new(),
+            });
+            entry.points.push((eval_col.value(i), v));
         }
     }
     Ok(by_series.into_values().collect())
