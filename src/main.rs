@@ -23,6 +23,8 @@ use anyhow::{anyhow, Result};
 use axum::routing::{get, post};
 use axum::{middleware, Router};
 use metrics_exporter_prometheus::PrometheusBuilder;
+use tower::limit::ConcurrencyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -61,6 +63,17 @@ struct Args {
     /// When `Some`, /api/v1/* requires `Authorization: Bearer <T>`.
     /// When `None`, auth is disabled.
     api_token: Option<ApiToken>,
+    /// Per-request deadline for the /api/v1/* layer. After this
+    /// elapses the response is `408 Request Timeout`.
+    query_timeout: Duration,
+    /// Hard cap on simultaneously-running /api/v1/* requests. New
+    /// requests beyond the cap wait their turn (axum's tower
+    /// integration backpressures on `poll_ready`).
+    max_concurrent_queries: usize,
+    /// Memory pool ceiling handed to DataFusion. A query whose
+    /// in-flight allocations would exceed this fails with
+    /// `ResourcesExhausted` instead of OOM-killing the process.
+    query_memory_limit_bytes: usize,
 }
 
 impl Args {
@@ -69,6 +82,9 @@ impl Args {
         let mut bind: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let mut flush_interval = Duration::from_secs(300);
         let mut shutdown_timeout = Duration::from_secs(30);
+        let mut query_timeout = Duration::from_secs(30);
+        let mut max_concurrent_queries: usize = 64;
+        let mut query_memory_limit_mb: u64 = 1024;
         let mut catalog_kind = String::from("memory");
         let mut warehouse_uri = String::from("memory:///warehouse");
         let mut table_bucket_arn: Option<String> = None;
@@ -89,6 +105,18 @@ impl Args {
                 "--shutdown-timeout-secs" => {
                     let s: u64 = v.parse().expect("--shutdown-timeout-secs <seconds>");
                     shutdown_timeout = Duration::from_secs(s);
+                }
+                "--query-timeout-secs" => {
+                    let s: u64 = v.parse().expect("--query-timeout-secs <seconds>");
+                    query_timeout = Duration::from_secs(s);
+                }
+                "--max-concurrent-queries" => {
+                    max_concurrent_queries =
+                        v.parse().expect("--max-concurrent-queries <count>");
+                }
+                "--query-memory-limit-mb" => {
+                    query_memory_limit_mb =
+                        v.parse().expect("--query-memory-limit-mb <megabytes>");
                 }
                 "--catalog" => catalog_kind = v,
                 "--warehouse-uri" => warehouse_uri = v,
@@ -126,6 +154,17 @@ impl Args {
             .filter(|s| !s.is_empty())
             .map(ApiToken);
 
+        let query_memory_limit_bytes = (query_memory_limit_mb as usize)
+            .checked_mul(1024 * 1024)
+            .expect("--query-memory-limit-mb overflow");
+
+        if max_concurrent_queries == 0 {
+            return Err(anyhow!("--max-concurrent-queries must be > 0"));
+        }
+        if query_memory_limit_bytes == 0 {
+            return Err(anyhow!("--query-memory-limit-mb must be > 0"));
+        }
+
         Ok(Self {
             wal_dir,
             bind,
@@ -134,6 +173,9 @@ impl Args {
             catalog,
             aws_region,
             api_token,
+            query_timeout,
+            max_concurrent_queries,
+            query_memory_limit_bytes,
         })
     }
 }
@@ -164,7 +206,9 @@ async fn main() -> Result<()> {
         .install_recorder()
         .map_err(|e| anyhow!("install prometheus recorder: {e}"))?;
 
-    let state = Arc::new(AppState::open(&args.wal_dir, &args.catalog).await?);
+    let state = Arc::new(
+        AppState::open(&args.wal_dir, &args.catalog, args.query_memory_limit_bytes).await?,
+    );
     spawn_flusher(state.ingest.clone(), args.flush_interval);
 
     // /api/v1/* is bearer-auth gated when --api-token / SKALDBERG_API_TOKEN
@@ -199,7 +243,14 @@ async fn main() -> Result<()> {
         .layer(middleware::from_fn_with_state(
             api_token_state,
             auth::require_bearer_token,
-        ));
+        ))
+        // Guardrails for the query path. Both layers wrap *only*
+        // /api/v1/* — /healthz and /metrics need to stay snappy
+        // for orchestrators / Prometheus scrape regardless of API
+        // load. Timeout layer goes outermost so that even waiting
+        // for a concurrency slot counts toward the deadline.
+        .layer(ConcurrencyLimitLayer::new(args.max_concurrent_queries))
+        .layer(TimeoutLayer::new(args.query_timeout));
     // /metrics stays outside the auth layer — typical Prometheus
     // scrape comes from a sidecar / kubelet that wouldn't carry the
     // operator's bearer token. Operators who need to keep /metrics
