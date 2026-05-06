@@ -26,12 +26,17 @@
 #        - /api/v1/series (selector-based listing)
 #        - /api/v1/query for: pure selector (label = pushdown),
 #          sum(...) by (...), topk(...), scalar × selector,
-#          rate(...), sum(rate(...)) by (...) (two-step pushdown)
-#        - /api/v1/query_range for: rate(...), sum(rate(...))
+#          rate(...), sum(rate(...)) by (...) (two-step pushdown),
+#          histogram_quantile(q, rate(...)), <sel> / <sel>
+#          (vec × vec), topk(n, rate(...)) [by ...]
+#        - /api/v1/query_range for: rate(...), sum(rate(...)),
+#          histogram_quantile(q, rate(...)), <sel> / <sel>,
+#          topk(n, rate(...)) [by ...]
 #      The point isn't every Prometheus semantic — it's that LAG /
-#      VALUES / element_at / multi-CTE / two-step pushdown SQL
-#      planners all produce the right shape against Parquet objects
-#      on S3 Tables (not just the in-memory catalog).
+#      VALUES / element_at / multi-CTE / two-step pushdown / cross-
+#      side JOIN / window-based quantile interpolation SQL planners
+#      all produce the right shape against Parquet objects on S3
+#      Tables (not just the in-memory catalog).
 #   5. asserts AWS-side that `skaldberg.{series, samples}` tables
 #      exist via `aws s3tables list-tables`
 #   6. shuts the server down with SIGTERM
@@ -133,15 +138,28 @@ echo "server healthy"
 ts=$(python3 -c 'import time; print(int(time.time()*1000))')
 echo "ts=$ts"
 
-# Use a run-unique metric so range queries see exactly this run's
-# samples (not accumulated history from previous smoke runs).
+# Use run-unique metric names so range queries see exactly this
+# run's samples (not accumulated history from previous smoke runs).
 v8_metric="smoke_v8_${ts}"
+hq_metric="hq_v8_${ts}"
+vv_lhs_metric="vv_lhs_v8_${ts}"
+vv_rhs_metric="vv_rhs_v8_${ts}"
 echo "phase8 metric: $v8_metric"
+echo "histogram metric: $hq_metric"
+echo "vec-vec metrics: $vv_lhs_metric / $vv_rhs_metric"
 
-echo "--- ingest baseline + 3 phase-8 series ---"
-# Build three counter-style series. Sample timestamps are 5..1 evenly
-# spaced 10s offsets ending at $ts so the latest sample sits at "now"
-# and the eldest is 40s in the past — well within any 1m range query.
+echo "--- ingest baseline + phase-8 fixtures ---"
+# Counter series for rate / sum(rate) / topk(rate): 3 series under
+# `$v8_metric` with rates 1.0 / 0.5 / 2.0 per sec over [t-40s, t].
+#
+# Histogram for histogram_quantile: 4 buckets × 2 jobs under
+# `$hq_metric`, two timestamps (t-30s zero baseline + t cumulative
+# count). rate over [1m] yields per-bucket per-sec rates we hand-
+# computed; the assertions below match those.
+#
+# Vec×vec fixture: `$vv_lhs_metric` and `$vv_rhs_metric` carry the
+# same dimensional labels at one timestamp so 1:1 join arithmetic
+# is well-defined.
 read -r -d '' ingest_body <<EOF || true
 {"samples":[
  {"metric":"smoke_s3tables","labels":{"job":"smoke"},"ts":$ts,"value":1.0},
@@ -159,7 +177,27 @@ read -r -d '' ingest_body <<EOF || true
  {"metric":"$v8_metric","labels":{"job":"other","status":"ok"},"ts":$((ts-30000)),"value":20},
  {"metric":"$v8_metric","labels":{"job":"other","status":"ok"},"ts":$((ts-20000)),"value":40},
  {"metric":"$v8_metric","labels":{"job":"other","status":"ok"},"ts":$((ts-10000)),"value":60},
- {"metric":"$v8_metric","labels":{"job":"other","status":"ok"},"ts":$ts,"value":80}
+ {"metric":"$v8_metric","labels":{"job":"other","status":"ok"},"ts":$ts,"value":80},
+ {"metric":"$hq_metric","labels":{"job":"A","le":"0.1"},"ts":$((ts-30000)),"value":0},
+ {"metric":"$hq_metric","labels":{"job":"A","le":"0.1"},"ts":$ts,"value":5},
+ {"metric":"$hq_metric","labels":{"job":"A","le":"0.5"},"ts":$((ts-30000)),"value":0},
+ {"metric":"$hq_metric","labels":{"job":"A","le":"0.5"},"ts":$ts,"value":8},
+ {"metric":"$hq_metric","labels":{"job":"A","le":"1.0"},"ts":$((ts-30000)),"value":0},
+ {"metric":"$hq_metric","labels":{"job":"A","le":"1.0"},"ts":$ts,"value":9},
+ {"metric":"$hq_metric","labels":{"job":"A","le":"+Inf"},"ts":$((ts-30000)),"value":0},
+ {"metric":"$hq_metric","labels":{"job":"A","le":"+Inf"},"ts":$ts,"value":10},
+ {"metric":"$hq_metric","labels":{"job":"B","le":"0.1"},"ts":$((ts-30000)),"value":0},
+ {"metric":"$hq_metric","labels":{"job":"B","le":"0.1"},"ts":$ts,"value":1},
+ {"metric":"$hq_metric","labels":{"job":"B","le":"0.5"},"ts":$((ts-30000)),"value":0},
+ {"metric":"$hq_metric","labels":{"job":"B","le":"0.5"},"ts":$ts,"value":2},
+ {"metric":"$hq_metric","labels":{"job":"B","le":"1.0"},"ts":$((ts-30000)),"value":0},
+ {"metric":"$hq_metric","labels":{"job":"B","le":"1.0"},"ts":$ts,"value":8},
+ {"metric":"$hq_metric","labels":{"job":"B","le":"+Inf"},"ts":$((ts-30000)),"value":0},
+ {"metric":"$hq_metric","labels":{"job":"B","le":"+Inf"},"ts":$ts,"value":10},
+ {"metric":"$vv_lhs_metric","labels":{"job":"api","status":"200"},"ts":$ts,"value":300},
+ {"metric":"$vv_lhs_metric","labels":{"job":"api","status":"500"},"ts":$ts,"value":10},
+ {"metric":"$vv_rhs_metric","labels":{"job":"api","status":"200"},"ts":$ts,"value":2},
+ {"metric":"$vv_rhs_metric","labels":{"job":"api","status":"500"},"ts":$ts,"value":5}
 ]}
 EOF
 curl -fsS -X POST "http://127.0.0.1:$port/api/v1/ingest" \
@@ -176,8 +214,8 @@ count_resp=$(curl -fsS -X POST "http://127.0.0.1:$port/api/v1/sql" \
     -d '{"sql":"SELECT COUNT(*) AS n FROM iceberg.skaldberg.samples"}')
 echo "$count_resp"
 n=$(printf '%s' "$count_resp" | python3 -c 'import sys, json; print(json.load(sys.stdin)["rows"][0]["n"])')
-if [[ "$n" -lt 16 ]]; then
-    echo "ERROR: expected COUNT(*) >= 16, got $n" >&2
+if [[ "$n" -lt 37 ]]; then
+    echo "ERROR: expected COUNT(*) >= 37, got $n" >&2
     exit 1
 fi
 
@@ -319,6 +357,114 @@ assert_promql "/api/v1/series?match[]=${v8_metric}" \
     'import sys,json
 r=json.load(sys.stdin)["data"]
 assert len(r)==3, f"expected 3 series, got {len(r)}"
+'
+
+# ---------- Phase 8-6 SQL pushdown coverage ----------
+#
+# histogram_quantile / vector × vector / topk(rate(...)) — the
+# query shapes Phase 8-6 added entirely-in-SQL paths for. Smoke
+# values were chosen to match hand-computed expectations.
+
+# histogram_quantile(0.9, rate(hq[1m])) — both jobs land at le=1.0
+# (job=A interpolates to exactly 1.0; job=B's crossing is +Inf so
+# returns prev_le = 1.0).
+assert_promql "instant: histogram_quantile(0.9, rate(${hq_metric}[1m]))" \
+    "http://127.0.0.1:$port/api/v1/query?query=$(python3 -c "import urllib.parse; print(urllib.parse.quote('histogram_quantile(0.9, rate(${hq_metric}[1m]))'))")&time=$(python3 -c "print($ts/1000.0)")" \
+    'import sys,json
+r=json.load(sys.stdin)["data"]["result"]
+got={row["metric"]["job"]:float(row["value"][1]) for row in r}
+assert abs(got.get("A",-1)-1.0)<1e-6 and abs(got.get("B",-1)-1.0)<1e-6, f"got {got}"
+# `le` must be stripped from the output labels.
+for row in r:
+    assert "le" not in row["metric"], f"le not stripped: {row}"
+'
+
+# histogram_quantile(0.5, rate(hq[1m])) — A interpolates at first
+# bucket → 0.1; B interpolates between le=0.5 and le=1.0 → 0.75.
+assert_promql "instant: histogram_quantile(0.5, rate(${hq_metric}[1m]))" \
+    "http://127.0.0.1:$port/api/v1/query?query=$(python3 -c "import urllib.parse; print(urllib.parse.quote('histogram_quantile(0.5, rate(${hq_metric}[1m]))'))")&time=$(python3 -c "print($ts/1000.0)")" \
+    'import sys,json
+r=json.load(sys.stdin)["data"]["result"]
+got={row["metric"]["job"]:float(row["value"][1]) for row in r}
+assert abs(got.get("A",-1)-0.1)<1e-6 and abs(got.get("B",-1)-0.75)<1e-6, f"got {got}"
+'
+
+# Matrix histogram_quantile — exercises the cross-join VALUES base
+# joined to the same quantile pipeline.
+phase8_end=$(python3 -c "print($ts/1000.0)")
+phase8_start=$(python3 -c "print($ts/1000.0 - 30)")
+assert_promql "matrix: histogram_quantile(0.9, rate(${hq_metric}[1m]))" \
+    "http://127.0.0.1:$port/api/v1/query_range?query=$(python3 -c "import urllib.parse; print(urllib.parse.quote('histogram_quantile(0.9, rate(${hq_metric}[1m]))'))")&start=${phase8_start}&end=${phase8_end}&step=15s" \
+    'import sys,json
+r=json.load(sys.stdin)["data"]["result"]
+jobs={row["metric"]["job"] for row in r}
+assert jobs=={"A","B"}, f"expected jobs A,B; got {jobs}"
+for row in r:
+    last=float(row["values"][-1][1])
+    assert abs(last-1.0)<1e-6, f"latest q90 should be 1.0, got {last} for {row[chr(34)+chr(109)+chr(101)+chr(116)+chr(114)+chr(105)+chr(99)+chr(34)]}"
+'
+
+# Vector × vector instant: lhs / rhs joins on (job, status).
+# {api,200}: 300/2 = 150 ; {api,500}: 10/5 = 2.
+assert_promql "instant: ${vv_lhs_metric} / ${vv_rhs_metric}" \
+    "http://127.0.0.1:$port/api/v1/query?query=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${vv_lhs_metric} / ${vv_rhs_metric}'))")&time=$(python3 -c "print($ts/1000.0)")" \
+    'import sys,json
+r=json.load(sys.stdin)["data"]["result"]
+got={(row["metric"]["job"], row["metric"]["status"]):float(row["value"][1]) for row in r}
+assert abs(got.get(("api","200"),-1)-150.0)<1e-6, f"got {got}"
+assert abs(got.get(("api","500"),-1)-2.0)<1e-6, f"got {got}"
+# Arithmetic strips __name__.
+for row in r:
+    assert "__name__" not in row["metric"], f"__name__ should be stripped: {row}"
+'
+
+# Vector × vector matrix: same metrics, single timestamp ⇒ 1 point
+# per matched (job, status) at the latest eval.
+assert_promql "matrix: ${vv_lhs_metric} / ${vv_rhs_metric}" \
+    "http://127.0.0.1:$port/api/v1/query_range?query=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${vv_lhs_metric} / ${vv_rhs_metric}'))")&start=${phase8_start}&end=${phase8_end}&step=15s" \
+    'import sys,json
+r=json.load(sys.stdin)["data"]["result"]
+got={(row["metric"]["job"], row["metric"]["status"]): row["values"] for row in r}
+# Each pair has exactly one ingested ts, so values list has one entry.
+v200=got.get(("api","200"))
+v500=got.get(("api","500"))
+assert v200 and abs(float(v200[-1][1])-150.0)<1e-6, f"200 got {v200}"
+assert v500 and abs(float(v500[-1][1])-2.0)<1e-6, f"500 got {v500}"
+'
+
+# topk(1, rate(v8[1m])): rates 1/0.5/2 → other/ok wins globally.
+assert_promql "instant: topk(1, rate(${v8_metric}[1m]))" \
+    "http://127.0.0.1:$port/api/v1/query?query=$(python3 -c "import urllib.parse; print(urllib.parse.quote('topk(1, rate(${v8_metric}[1m]))'))")&time=$(python3 -c "print($ts/1000.0)")" \
+    'import sys,json
+r=json.load(sys.stdin)["data"]["result"]
+assert len(r)==1, f"expected 1 row, got {len(r)}"
+v=float(r[0]["value"][1])
+assert abs(v-2.0)<1e-6, f"topk should be 2.0, got {v}"
+assert r[0]["metric"]["job"]=="other", f"unexpected job: {r[0]}"
+# topk is a filter, so __name__ stays.
+assert "__name__" in r[0]["metric"], f"__name__ should be preserved: {r[0]}"
+'
+
+# topk(1, rate()) by (job): smoke=1.0 (smoke/ok), other=2.0
+assert_promql "instant: topk(1, rate(${v8_metric}[1m])) by (job)" \
+    "http://127.0.0.1:$port/api/v1/query?query=$(python3 -c "import urllib.parse; print(urllib.parse.quote('topk(1, rate(${v8_metric}[1m])) by (job)'))")&time=$(python3 -c "print($ts/1000.0)")" \
+    'import sys,json
+r=json.load(sys.stdin)["data"]["result"]
+got={row["metric"]["job"]: float(row["value"][1]) for row in r}
+assert abs(got.get("smoke",-1)-1.0)<1e-6 and abs(got.get("other",-1)-2.0)<1e-6, f"got {got}"
+'
+
+# matrix topk(1, rate()) by (job): same per-eval winners across the
+# 30s window. Verifies the matrix two-step (per_series_rangefn_range_ctes
+# → ROW_NUMBER partition by (eval_us, job)) plans on S3 Tables.
+assert_promql "matrix: topk(1, rate(${v8_metric}[1m])) by (job)" \
+    "http://127.0.0.1:$port/api/v1/query_range?query=$(python3 -c "import urllib.parse; print(urllib.parse.quote('topk(1, rate(${v8_metric}[1m])) by (job)'))")&start=${phase8_start}&end=${phase8_end}&step=15s" \
+    'import sys,json
+r=json.load(sys.stdin)["data"]["result"]
+jobs={row["metric"]["job"] for row in r}
+assert jobs=={"smoke","other"}, f"expected jobs {{smoke,other}}, got {jobs}"
+last={row["metric"]["job"]: float(row["values"][-1][1]) for row in r}
+assert abs(last["smoke"]-1.0)<1e-6 and abs(last["other"]-2.0)<1e-6, f"latest values: {last}"
 '
 
 echo "--- AWS list-tables under skaldberg ---"
