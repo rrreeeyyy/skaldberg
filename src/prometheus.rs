@@ -686,12 +686,177 @@ fn build_range_range_fn_sql(
     sample_where: &str,
 ) -> String {
     let cat = DF_CATALOG_NAME;
+    let ctes = per_series_rangefn_range_ctes(op, range_us, values_clause, sample_where);
+    format!(
+        "{ctes} \
+         SELECT s.metric_name, s.labels, ps.eval_us, ps.rate_v AS v \
+         FROM per_series ps \
+         JOIN {cat}.skaldberg.series s ON ps.series_id = s.series_id \
+         ORDER BY s.metric_name, ps.eval_us"
+    )
+}
 
-    // Cross-join base CTE: each sample paired with every eval whose
-    // (eval - range, eval] window contains it. `value + 0.0` and
-    // `CAST(... AS BIGINT)` strip Parquet field metadata so the
-    // downstream window functions plan cleanly (same workaround as
-    // the instant path).
+/// Matrix-query counterpart of `instant_aggregate_over_rangefn_via_sql`.
+/// Builds the same per-eval per-series rate CTE used by the bare
+/// `rate(...)` matrix path, then wraps it in an outer
+/// `GROUP BY eval_us, [retained labels]` so the entire pipeline
+/// (rate + aggregate) runs in DataFusion. Aggregations strip
+/// `__name__`.
+async fn range_aggregate_over_rangefn_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    range_us: i64,
+    fn_op: RangeFnOp,
+    agg_op: AggOp,
+    modifier: Option<&LabelModifier>,
+    start_us: i64,
+    end_us: i64,
+    step_us: i64,
+) -> Result<Vec<RangePoints>, PromError> {
+    let mut evals = Vec::new();
+    let mut t = start_us;
+    while t <= end_us {
+        evals.push(t);
+        if evals.len() > MAX_RANGE_EVALS {
+            return Err(PromError::bad_data(format!(
+                "range query produces > {MAX_RANGE_EVALS} eval points; pick a larger step"
+            )));
+        }
+        t = t.saturating_add(step_us);
+    }
+    if evals.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let global_lo = start_us.saturating_sub(range_us);
+    let mut sample_conds = selector_predicates(sel);
+    sample_conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(global_lo),
+        us_to_ts_lit(end_us),
+    ));
+    let sample_where = sample_conds.join(" AND ");
+
+    let mut values_parts = Vec::with_capacity(evals.len());
+    for v in &evals {
+        values_parts.push(format!("({v})"));
+    }
+    let values_clause = values_parts.join(", ");
+
+    let ctes = per_series_rangefn_range_ctes(fn_op, range_us, &values_clause, &sample_where);
+
+    let group_keys = aggregate_group_keys(modifier);
+    let label_exprs: Vec<String> = group_keys
+        .iter()
+        .map(|k| format!("element_at(s.labels, '{}')[1]", sql_escape(k)))
+        .collect();
+    let select_label_part = if label_exprs.is_empty() {
+        String::new()
+    } else {
+        let mut parts: Vec<String> = Vec::with_capacity(label_exprs.len());
+        for (i, e) in label_exprs.iter().enumerate() {
+            parts.push(format!("{e} AS lbl_{i}"));
+        }
+        format!("{}, ", parts.join(", "))
+    };
+
+    let mut group_cols = vec!["ps.eval_us".to_string()];
+    group_cols.extend(label_exprs.iter().cloned());
+    let group_by_clause = format!(" GROUP BY {}", group_cols.join(", "));
+    // Order labels first so each (retained-label) group's points
+    // come out contiguous and chronologically sorted.
+    let mut order_cols = label_exprs.clone();
+    order_cols.push("ps.eval_us".to_string());
+    let order_by_clause = format!(" ORDER BY {}", order_cols.join(", "));
+
+    let agg_call = agg_call_sql(agg_op, "ps.rate_v");
+    let cat = DF_CATALOG_NAME;
+
+    let sql = format!(
+        "{ctes} \
+         SELECT ps.eval_us, {select_label_part}{agg_call} AS agg_v \
+         FROM per_series ps \
+         JOIN {cat}.skaldberg.series s ON ps.series_id = s.series_id\
+         {group_by_clause}\
+         {order_by_clause}"
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("range agg-over-rate sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("range agg-over-rate collect: {e}")))?;
+
+    use arrow::array::Int64Array;
+    let label_count = group_keys.len();
+    let mut by_group: BTreeMap<BTreeMap<String, String>, Vec<(i64, f64)>> = BTreeMap::new();
+    for batch in batches {
+        let eval_col = batch.column(0).as_any().downcast_ref::<Int64Array>()
+            .ok_or_else(|| PromError::internal("range agg-over-rate eval_us col"))?;
+        let agg_col = batch.column(1 + label_count).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("range agg-over-rate value col"))?;
+        let mut label_arrays: Vec<&StringArray> = Vec::with_capacity(label_count);
+        for li in 0..label_count {
+            let arr = batch.column(1 + li).as_any().downcast_ref::<StringArray>()
+                .ok_or_else(|| PromError::internal("range agg-over-rate label col"))?;
+            label_arrays.push(arr);
+        }
+        for i in 0..batch.num_rows() {
+            if agg_col.is_null(i) {
+                continue;
+            }
+            let v = agg_col.value(i);
+            if !v.is_finite() {
+                continue;
+            }
+            let mut labels = BTreeMap::new();
+            for (li, key) in group_keys.iter().enumerate() {
+                if !label_arrays[li].is_null(i) {
+                    labels.insert(key.clone(), label_arrays[li].value(i).to_string());
+                }
+            }
+            by_group
+                .entry(labels)
+                .or_default()
+                .push((eval_col.value(i), v));
+        }
+    }
+    Ok(by_group
+        .into_iter()
+        .filter(|(_, pts)| !pts.is_empty())
+        .map(|(labels, points)| RangePoints {
+            metric_name: String::new(),
+            labels,
+            points,
+        })
+        .collect())
+}
+
+/// Range counterpart of `per_series_rangefn_ctes`: yields one
+/// `(eval_us, series_id, rate_v)` row per `(eval, series)` pair
+/// for a range-function call evaluated at the given eval timestamps.
+///
+/// `base` cross-joins eval timestamps with the candidate samples;
+/// each downstream CTE partitions its window functions by
+/// `(eval_us, series_id)` so per-eval state stays isolated.
+/// Per-pair filtering (`n >= 2`, `span > 0`, etc.) lives inside
+/// `per_series` so consumers don't repeat it. Reused by:
+///   - `build_range_range_fn_sql` for `/api/v1/query_range` over
+///     `rate(...)` etc.
+///   - `range_aggregate_over_rangefn_via_sql` for `sum(rate(...))`
+///     and friends in matrix queries.
+fn per_series_rangefn_range_ctes(
+    op: RangeFnOp,
+    range_us: i64,
+    values_clause: &str,
+    sample_where: &str,
+) -> String {
+    let cat = DF_CATALOG_NAME;
+
     let base = format!(
         "base AS ( \
            SELECT et.eval_us, sa.series_id, \
@@ -733,12 +898,12 @@ fn build_range_range_fn_sql(
                           COUNT(*) AS n \
                    FROM adjusted \
                    GROUP BY eval_us, series_id \
-                 ) \
-                 SELECT s.metric_name, s.labels, a.eval_us, ({value_expr}) AS v \
-                 FROM agg a \
-                 JOIN {cat}.skaldberg.series s ON a.series_id = s.series_id \
-                 WHERE a.n >= 2 AND a.last_ts_us > a.first_ts_us \
-                 ORDER BY s.metric_name, a.eval_us"
+                 ), \
+                 per_series AS ( \
+                   SELECT eval_us, series_id, ({value_expr}) AS rate_v \
+                   FROM agg \
+                   WHERE n >= 2 AND last_ts_us > first_ts_us \
+                 )"
             )
         }
         RangeFnOp::Irate => {
@@ -752,13 +917,13 @@ fn build_range_range_fn_sql(
                           COUNT(*) OVER (PARTITION BY eval_us, series_id) AS total_n \
                    FROM base \
                    WINDOW w AS (PARTITION BY eval_us, series_id ORDER BY ts_us) \
-                 ) \
-                 SELECT s.metric_name, s.labels, r.eval_us, \
-                        ((CASE WHEN value >= prev_v THEN value - prev_v ELSE value END) * 1000000.0 / (ts_us - prev_ts_us)) AS v \
-                 FROM ranked r \
-                 JOIN {cat}.skaldberg.series s ON r.series_id = s.series_id \
-                 WHERE r.rn_desc = 1 AND r.total_n >= 2 AND r.ts_us > r.prev_ts_us \
-                 ORDER BY s.metric_name, r.eval_us"
+                 ), \
+                 per_series AS ( \
+                   SELECT eval_us, series_id, \
+                          ((CASE WHEN value >= prev_v THEN value - prev_v ELSE value END) * 1000000.0 / (ts_us - prev_ts_us)) AS rate_v \
+                   FROM ranked \
+                   WHERE rn_desc = 1 AND total_n >= 2 AND ts_us > prev_ts_us \
+                 )"
             )
         }
         RangeFnOp::Delta => {
@@ -776,13 +941,13 @@ fn build_range_range_fn_sql(
                  ), \
                  last_v AS ( \
                    SELECT eval_us, series_id, value AS last_val FROM ranked WHERE rn_desc = 1 \
-                 ) \
-                 SELECT s.metric_name, s.labels, e.eval_us, (l.last_val - e.first_v) AS v \
-                 FROM endpoints e \
-                 JOIN last_v l ON e.eval_us = l.eval_us AND e.series_id = l.series_id \
-                 JOIN {cat}.skaldberg.series s ON e.series_id = s.series_id \
-                 WHERE e.total_n >= 2 \
-                 ORDER BY s.metric_name, e.eval_us"
+                 ), \
+                 per_series AS ( \
+                   SELECT e.eval_us, e.series_id, (l.last_val - e.first_v) AS rate_v \
+                   FROM endpoints e \
+                   JOIN last_v l ON e.eval_us = l.eval_us AND e.series_id = l.series_id \
+                   WHERE e.total_n >= 2 \
+                 )"
             )
         }
     }
@@ -898,6 +1063,23 @@ fn evaluate_range<'a>(
                     if let Some(sel) = pure_selector(inner) {
                         return range_aggregate_via_sql(
                             state, sel, op, modifier, start_us, end_us,
+                        )
+                        .await;
+                    }
+                    // Two-step pushdown: matrix `<agg>(<rate-fn>(<sel>[r]))`
+                    // — `sum(rate(...)) by (...)` etc. Compose the per-eval
+                    // per-series rate CTE with an outer GROUP BY over the
+                    // retained labels so the entire pipeline runs in
+                    // DataFusion.
+                    if let Some(QueryKind::RangeFn {
+                        sel,
+                        range_us,
+                        op: fn_op,
+                    }) = detect_query_kind(inner)
+                    {
+                        return range_aggregate_over_rangefn_via_sql(
+                            state, sel, range_us, fn_op, op, modifier,
+                            start_us, end_us, step_us,
                         )
                         .await;
                     }
