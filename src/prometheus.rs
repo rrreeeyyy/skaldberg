@@ -41,7 +41,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Form, Json};
 use chrono::{DateTime, Utc};
 use promql_parser::label::{MatchOp, Matcher};
-use promql_parser::parser::token::{T_AVG, T_COUNT, T_MAX, T_MIN, T_SUM};
+use promql_parser::parser::token::{T_AVG, T_BOTTOMK, T_COUNT, T_MAX, T_MIN, T_SUM, T_TOPK};
 use promql_parser::parser::{parse, Expr, LabelModifier, VectorSelector};
 use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
@@ -170,6 +170,15 @@ fn evaluate_instant<'a>(state: &'a AppState, expr: &'a Expr, time_us: i64) -> In
             Some(QueryKind::HistogramQuantile { quantile, inner }) => {
                 let inner_pts = evaluate_instant(state, inner, time_us).await?;
                 Ok(histogram_quantile_instant(inner_pts, quantile, time_us))
+            }
+            Some(QueryKind::TopK {
+                n,
+                top,
+                modifier,
+                inner,
+            }) => {
+                let inner_pts = evaluate_instant(state, inner, time_us).await?;
+                Ok(topk_instant_points(inner_pts, n, top, modifier))
             }
             None => Ok(vec![]),
         }
@@ -344,6 +353,16 @@ fn evaluate_range<'a>(
                     evaluate_range(state, inner, start_us, end_us, step_us).await?;
                 Ok(histogram_quantile_range(inner_series, quantile))
             }
+            Some(QueryKind::TopK {
+                n,
+                top,
+                modifier,
+                inner,
+            }) => {
+                let inner_series =
+                    evaluate_range(state, inner, start_us, end_us, step_us).await?;
+                Ok(topk_range_points(inner_series, n, top, modifier))
+            }
             None => Ok(vec![]),
         }
     })
@@ -445,6 +464,107 @@ fn aggregate_range_points(
         }
     }
     out
+}
+
+/// `topk` / `bottomk` over an instant vector. Unlike the reductive
+/// aggregations these are filters: the surviving series keep their
+/// `__name__` and full label set. Within each `(by/without)` group
+/// we sort by value and take the n largest (`top=true`) or smallest.
+fn topk_instant_points(
+    inner: Vec<InstantPoint>,
+    n: usize,
+    top: bool,
+    modifier: Option<&LabelModifier>,
+) -> Vec<InstantPoint> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut groups: BTreeMap<BTreeMap<String, String>, Vec<InstantPoint>> = BTreeMap::new();
+    for p in inner {
+        let key = retained_labels(&p.labels, modifier);
+        groups.entry(key).or_default().push(p);
+    }
+    let mut out = Vec::new();
+    for (_, mut members) in groups {
+        members.sort_by(|a, b| {
+            let ord = a
+                .value
+                .partial_cmp(&b.value)
+                .unwrap_or(std::cmp::Ordering::Equal);
+            if top {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+        out.extend(members.into_iter().take(n));
+    }
+    out
+}
+
+/// Range-query analogue: at every timestamp seen across each group,
+/// pick the n largest / smallest series and reattach the value to
+/// the original (full-label) series. Output is one entry per surviving
+/// (series, ts) pair, regrouped by series identity.
+fn topk_range_points(
+    inner: Vec<RangePoints>,
+    n: usize,
+    top: bool,
+    modifier: Option<&LabelModifier>,
+) -> Vec<RangePoints> {
+    if n == 0 {
+        return Vec::new();
+    }
+    // Group inner series by retained labels.
+    let mut groups: BTreeMap<BTreeMap<String, String>, Vec<RangePoints>> = BTreeMap::new();
+    for series in inner {
+        let key = retained_labels(&series.labels, modifier);
+        groups.entry(key).or_default().push(series);
+    }
+
+    // For O(log) lookups per (series, ts), turn each member's points
+    // into a BTreeMap. Output keyed by series identity so we can
+    // accumulate points back per surviving series across timestamps.
+    let mut out_map: BTreeMap<String, RangePoints> = BTreeMap::new();
+    for (_group_labels, members) in groups {
+        let by_ts: Vec<BTreeMap<i64, f64>> = members
+            .iter()
+            .map(|m| m.points.iter().copied().collect::<BTreeMap<_, _>>())
+            .collect();
+        let mut all_ts: BTreeSet<i64> = BTreeSet::new();
+        for m in &members {
+            for (ts, _) in &m.points {
+                all_ts.insert(*ts);
+            }
+        }
+        for ts in all_ts {
+            let mut at_ts: Vec<(usize, f64)> = Vec::new();
+            for (idx, pts) in by_ts.iter().enumerate() {
+                if let Some(&v) = pts.get(&ts) {
+                    at_ts.push((idx, v));
+                }
+            }
+            at_ts.sort_by(|a, b| {
+                let ord = a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal);
+                if top {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            });
+            for (idx, v) in at_ts.into_iter().take(n) {
+                let m = &members[idx];
+                let key = series_key(&m.metric_name, &m.labels);
+                let entry = out_map.entry(key).or_insert_with(|| RangePoints {
+                    metric_name: m.metric_name.clone(),
+                    labels: m.labels.clone(),
+                    points: Vec::new(),
+                });
+                entry.points.push((ts, v));
+            }
+        }
+    }
+    out_map.into_values().collect()
 }
 
 /// Reduce a vector of histogram-bucket points (each carrying an
@@ -930,6 +1050,16 @@ enum QueryKind<'a> {
     /// of a Prometheus histogram (cumulative `_bucket` series with
     /// `le="..."` labels).
     HistogramQuantile { quantile: f64, inner: &'a Expr },
+    /// `topk(n, vector)` / `bottomk(n, vector)` — keep the n largest
+    /// or smallest series within each `(by/without)` group. Unlike
+    /// the reductive aggregators, this is a filter: the surviving
+    /// series keep their full label set (and `__name__`) intact.
+    TopK {
+        n: usize,
+        top: bool,
+        modifier: Option<&'a LabelModifier>,
+        inner: &'a Expr,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -961,15 +1091,38 @@ enum AggOp {
 /// `match` as we add native semantics for more PromQL features.
 fn detect_query_kind(expr: &Expr) -> Option<QueryKind<'_>> {
     if let Expr::Aggregate(a) = expr {
-        if let Some(op) = parse_agg_op(a.op.id()) {
+        let op_id = a.op.id();
+        if op_id == T_TOPK || op_id == T_BOTTOMK {
+            // topk / bottomk carry the count `n` in `param`. Skip
+            // the recognizer if it's not a NumberLiteral — that
+            // shouldn't happen for valid PromQL (parser enforces it)
+            // but the fall-through to selector unwrap is harmless.
+            if let Some(param) = a.param.as_ref() {
+                if let Expr::NumberLiteral(num) = param.as_ref() {
+                    let n = if num.val.is_finite() && num.val > 0.0 {
+                        num.val as usize
+                    } else {
+                        0
+                    };
+                    return Some(QueryKind::TopK {
+                        n,
+                        top: op_id == T_TOPK,
+                        modifier: a.modifier.as_ref(),
+                        inner: a.expr.as_ref(),
+                    });
+                }
+            }
+        }
+        if let Some(op) = parse_agg_op(op_id) {
             return Some(QueryKind::Aggregate {
                 op,
                 modifier: a.modifier.as_ref(),
                 inner: a.expr.as_ref(),
             });
         }
-        // Unknown aggregation op (topk / quantile / stddev / ...) — fall
-        // through to selector unwrap so the panel still draws something.
+        // Unknown aggregation op (quantile / stddev / count_values / ...)
+        // — fall through to selector unwrap so the panel still draws
+        // something instead of erroring.
     }
     if let Expr::Call(c) = expr {
         if c.func.name.eq_ignore_ascii_case("histogram_quantile") && c.args.args.len() == 2 {
