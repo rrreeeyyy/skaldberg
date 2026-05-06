@@ -401,6 +401,12 @@ async fn instant_aggregate_over_rangefn_via_sql(
     modifier: Option<&LabelModifier>,
     time_us: i64,
 ) -> Result<Vec<InstantPoint>, PromError> {
+    if let Some(excluded) = modifier_excluded_keys(modifier) {
+        return instant_aggregate_over_rangefn_without_via_sql(
+            state, sel, range_us, fn_op, agg_op, excluded, time_us,
+        )
+        .await;
+    }
     let from_us = time_us - range_us;
     let mut conds = selector_predicates(sel);
     conds.push(format!(
@@ -483,6 +489,94 @@ async fn instant_aggregate_over_rangefn_via_sql(
                     labels.insert(key.clone(), label_arrays[li].value(i).to_string());
                 }
             }
+            out.push(InstantPoint {
+                metric_name: String::new(),
+                labels,
+                ts_us: time_us,
+                value: v,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// `<agg>(<rate-fn>(<sel>[r])) without (k1, k2, ...)`. Same shape
+/// as `instant_aggregate_over_rangefn_via_sql` but groups by a
+/// `string_agg`-built key over the labels MAP minus `excluded`.
+async fn instant_aggregate_over_rangefn_without_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    range_us: i64,
+    fn_op: RangeFnOp,
+    agg_op: AggOp,
+    excluded: &[String],
+    time_us: i64,
+) -> Result<Vec<InstantPoint>, PromError> {
+    let from_us = time_us - range_us;
+    let mut conds = selector_predicates(sel);
+    conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(from_us),
+        us_to_ts_lit(time_us),
+    ));
+    let where_clause = format!("WHERE {}", conds.join(" AND "));
+    let rate_ctes = per_series_rangefn_ctes(fn_op, &where_clause);
+    let excluded_filter = if excluded.is_empty() {
+        "TRUE".to_string()
+    } else {
+        format!("u.k NOT IN ({})", quoted_keys_list(excluded))
+    };
+    let agg_call = agg_call_sql(agg_op, "ps.rate_v");
+    let cat = DF_CATALOG_NAME;
+
+    let sql = format!(
+        "{rate_ctes}, \
+         gk_pairs AS ( \
+           SELECT u.series_id, u.k AS k, element_at(u.labels, u.k)[1] AS v \
+           FROM ( \
+             SELECT pps.series_id, s.labels, unnest(map_keys(s.labels)) AS k \
+             FROM per_series pps JOIN {cat}.skaldberg.series s ON pps.series_id = s.series_id \
+           ) u \
+           WHERE {excluded_filter} \
+         ), \
+         gk AS ( \
+           SELECT series_id, \
+                  COALESCE(string_agg(k || '=' || v, ',' ORDER BY k), '') AS group_key \
+           FROM gk_pairs GROUP BY series_id \
+         ), \
+         grouped AS ( \
+           SELECT gk.group_key, {agg_call} AS agg_v, MIN(ps.series_id) AS rep_sid \
+           FROM per_series ps JOIN gk ON ps.series_id = gk.series_id \
+           GROUP BY gk.group_key \
+         ) \
+         SELECT s.labels, grouped.agg_v \
+         FROM grouped \
+         JOIN {cat}.skaldberg.series s ON grouped.rep_sid = s.series_id"
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("agg-over-rate-without sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("agg-over-rate-without collect: {e}")))?;
+
+    let excluded_set: BTreeSet<&str> = excluded.iter().map(String::as_str).collect();
+    let mut out = Vec::new();
+    for batch in batches {
+        let labels_col = batch.column(0).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("agg-over-rate-without labels col"))?;
+        let agg_col = batch.column(1).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("agg-over-rate-without value not Float64"))?;
+        for i in 0..batch.num_rows() {
+            if agg_col.is_null(i) { continue; }
+            let v = agg_col.value(i);
+            if !v.is_finite() { continue; }
+            let mut labels = labels_to_btree(labels_col, i)?;
+            labels.retain(|k, _| !excluded_set.contains(k.as_str()));
             out.push(InstantPoint {
                 metric_name: String::new(),
                 labels,
@@ -898,6 +992,12 @@ async fn range_aggregate_over_rangefn_via_sql(
     end_us: i64,
     step_us: i64,
 ) -> Result<Vec<RangePoints>, PromError> {
+    if let Some(excluded) = modifier_excluded_keys(modifier) {
+        return range_aggregate_over_rangefn_without_via_sql(
+            state, sel, range_us, fn_op, agg_op, excluded, start_us, end_us, step_us,
+        )
+        .await;
+    }
     let mut evals = Vec::new();
     let mut t = start_us;
     while t <= end_us {
@@ -1175,6 +1275,124 @@ async fn range_histogram_quantile_via_sql(
                 .entry(labels)
                 .or_default()
                 .push((eval_col.value(i), v));
+        }
+    }
+    Ok(by_group
+        .into_iter()
+        .filter(|(_, pts)| !pts.is_empty())
+        .map(|(labels, points)| RangePoints {
+            metric_name: String::new(),
+            labels,
+            points,
+        })
+        .collect())
+}
+
+/// Matrix `<agg>(<rate-fn>(<sel>[r])) without (k1, k2, ...)`.
+async fn range_aggregate_over_rangefn_without_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    range_us: i64,
+    fn_op: RangeFnOp,
+    agg_op: AggOp,
+    excluded: &[String],
+    start_us: i64,
+    end_us: i64,
+    step_us: i64,
+) -> Result<Vec<RangePoints>, PromError> {
+    let mut evals = Vec::new();
+    let mut t = start_us;
+    while t <= end_us {
+        evals.push(t);
+        if evals.len() > MAX_RANGE_EVALS {
+            return Err(PromError::bad_data(format!(
+                "range query produces > {MAX_RANGE_EVALS} eval points; pick a larger step"
+            )));
+        }
+        t = t.saturating_add(step_us);
+    }
+    if evals.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let global_lo = start_us.saturating_sub(range_us);
+    let mut sample_conds = selector_predicates(sel);
+    sample_conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(global_lo),
+        us_to_ts_lit(end_us),
+    ));
+    let sample_where = sample_conds.join(" AND ");
+    let mut values_parts = Vec::with_capacity(evals.len());
+    for v in &evals {
+        values_parts.push(format!("({v})"));
+    }
+    let values_clause = values_parts.join(", ");
+    let rate_ctes = per_series_rangefn_range_ctes(fn_op, range_us, &values_clause, &sample_where);
+    let excluded_filter = if excluded.is_empty() {
+        "TRUE".to_string()
+    } else {
+        format!("u.k NOT IN ({})", quoted_keys_list(excluded))
+    };
+    let agg_call = agg_call_sql(agg_op, "ps.rate_v");
+    let cat = DF_CATALOG_NAME;
+
+    let sql = format!(
+        "{rate_ctes}, \
+         distinct_sids AS ( \
+           SELECT DISTINCT series_id FROM per_series \
+         ), \
+         gk_pairs AS ( \
+           SELECT u.series_id, u.k AS k, element_at(u.labels, u.k)[1] AS v \
+           FROM ( \
+             SELECT d.series_id, s.labels, unnest(map_keys(s.labels)) AS k \
+             FROM distinct_sids d JOIN {cat}.skaldberg.series s ON d.series_id = s.series_id \
+           ) u \
+           WHERE {excluded_filter} \
+         ), \
+         gk AS ( \
+           SELECT series_id, \
+                  COALESCE(string_agg(k || '=' || v, ',' ORDER BY k), '') AS group_key \
+           FROM gk_pairs GROUP BY series_id \
+         ), \
+         grouped AS ( \
+           SELECT ps.eval_us, gk.group_key, {agg_call} AS agg_v, MIN(ps.series_id) AS rep_sid \
+           FROM per_series ps JOIN gk ON ps.series_id = gk.series_id \
+           GROUP BY ps.eval_us, gk.group_key \
+         ) \
+         SELECT s.labels, grouped.eval_us, grouped.agg_v \
+         FROM grouped \
+         JOIN {cat}.skaldberg.series s ON grouped.rep_sid = s.series_id \
+         ORDER BY grouped.eval_us"
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("range agg-over-rate-without sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("range agg-over-rate-without collect: {e}")))?;
+
+    use arrow::array::Int64Array;
+    let excluded_set: BTreeSet<&str> = excluded.iter().map(String::as_str).collect();
+    let mut by_group: BTreeMap<BTreeMap<String, String>, Vec<(i64, f64)>> = BTreeMap::new();
+    for batch in batches {
+        let labels_col = batch.column(0).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("range agg-over-rate-without labels col"))?;
+        let eval_col = batch.column(1).as_any().downcast_ref::<Int64Array>()
+            .ok_or_else(|| PromError::internal("range agg-over-rate-without eval col"))?;
+        let agg_col = batch.column(2).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("range agg-over-rate-without value col"))?;
+        for i in 0..batch.num_rows() {
+            if agg_col.is_null(i) { continue; }
+            let v = agg_col.value(i);
+            if !v.is_finite() { continue; }
+            let mut labels = labels_to_btree(labels_col, i)?;
+            labels.retain(|k, _| !excluded_set.contains(k.as_str()));
+            by_group.entry(labels).or_default().push((eval_col.value(i), v));
         }
     }
     Ok(by_group
@@ -1534,13 +1752,38 @@ fn pure_selector(expr: &Expr) -> Option<&VectorSelector> {
     }
 }
 
-/// `by(...)` and "no modifier" can be pushed to SQL — both reduce to
-/// a fixed list of retained label keys (possibly empty). `without(...)`
-/// would need to know every label name in the group at planning
-/// time, which we only learn after reading the data, so it stays
-/// in Rust.
+/// All three modifier shapes (`None`, `by(...)`, `without(...)`)
+/// are pushable. `by(...)` / `None` use a fixed list of `element_at`
+/// columns for GROUP BY. `without(...)` doesn't know the label set
+/// at planning time, so it groups by a `string_agg`-built key over
+/// the labels MAP minus the excluded keys (same trick
+/// `histogram_quantile` / `vector × vector` already use).
 fn aggregate_can_push_down(modifier: Option<&LabelModifier>) -> bool {
-    matches!(modifier, None | Some(LabelModifier::Include(_)))
+    matches!(
+        modifier,
+        None | Some(LabelModifier::Include(_)) | Some(LabelModifier::Exclude(_))
+    )
+}
+
+/// Returns the `without (...)` keys when the modifier is `Exclude`.
+/// Used by pushdown functions to dispatch to the `string_agg`-keyed
+/// SQL path (vs. the explicit `element_at` GROUP BY for `by(...)` /
+/// `None`).
+fn modifier_excluded_keys(modifier: Option<&LabelModifier>) -> Option<&[String]> {
+    match modifier {
+        Some(LabelModifier::Exclude(ls)) => Some(&ls.labels),
+        _ => None,
+    }
+}
+
+/// SQL-quoted comma-separated list of label keys for `IN (...)` /
+/// `NOT IN (...)` clauses. Each key is single-quoted with embedded
+/// quotes escaped via `sql_escape`.
+fn quoted_keys_list(keys: &[String]) -> String {
+    keys.iter()
+        .map(|k| format!("'{}'", sql_escape(k)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Retained label keys for a SQL-pushed aggregation. None or
@@ -1577,6 +1820,13 @@ async fn instant_aggregate_via_sql(
     modifier: Option<&LabelModifier>,
     time_us: i64,
 ) -> Result<Vec<InstantPoint>, PromError> {
+    // `without(...)` doesn't have a fixed retained label set at
+    // planning time. Route it through the `string_agg`-keyed path
+    // instead of the `element_at` GROUP BY one.
+    if let Some(excluded) = modifier_excluded_keys(modifier) {
+        return instant_aggregate_without_via_sql(state, sel, op, excluded, time_us).await;
+    }
+
     let from_us = time_us - LOOKBACK_US;
     let group_keys = aggregate_group_keys(modifier);
 
@@ -1679,6 +1929,109 @@ async fn instant_aggregate_via_sql(
     Ok(out)
 }
 
+/// `<agg>(<selector>) without (k1, k2, ...)` evaluated as one SQL
+/// plan. The retained label set is "everything except k1, k2" —
+/// not knowable at planning time, so we build a `string_agg` group
+/// key per series over the labels MAP minus the excluded keys
+/// (same trick `histogram_quantile` and `vector × vector` already
+/// use), GROUP BY that key, and recover the output labels by
+/// joining a representative series back to the `series` table and
+/// stripping the excluded keys in Rust.
+async fn instant_aggregate_without_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    op: AggOp,
+    excluded: &[String],
+    time_us: i64,
+) -> Result<Vec<InstantPoint>, PromError> {
+    let from_us = time_us - LOOKBACK_US;
+    let mut window_conds = selector_predicates(sel);
+    window_conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(from_us),
+        us_to_ts_lit(time_us),
+    ));
+    let where_clause = format!(" WHERE {}", window_conds.join(" AND "));
+    // `without ()` (empty exclusion) is a valid PromQL shape that
+    // groups by every label — i.e. each unique label set is its own
+    // group. SQL `NOT IN ()` is a parse error, so emit a trivially-
+    // true predicate in that case.
+    let excluded_filter = if excluded.is_empty() {
+        "TRUE".to_string()
+    } else {
+        format!("u.k NOT IN ({})", quoted_keys_list(excluded))
+    };
+    let agg_call = agg_call_sql(op, "latest.value");
+    let cat = DF_CATALOG_NAME;
+
+    let sql = format!(
+        "WITH ws AS ( \
+           SELECT sa.series_id, sa.value, \
+                  ROW_NUMBER() OVER (PARTITION BY sa.series_id ORDER BY sa.timestamp DESC) AS rn \
+           FROM {cat}.skaldberg.samples sa \
+           JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
+           {where_clause} \
+         ), \
+         latest AS ( \
+           SELECT series_id, value FROM ws WHERE rn = 1 \
+         ), \
+         gk_pairs AS ( \
+           SELECT u.series_id, u.k AS k, element_at(u.labels, u.k)[1] AS v \
+           FROM ( \
+             SELECT lt.series_id, s.labels, unnest(map_keys(s.labels)) AS k \
+             FROM latest lt JOIN {cat}.skaldberg.series s ON lt.series_id = s.series_id \
+           ) u \
+           WHERE {excluded_filter} \
+         ), \
+         gk AS ( \
+           SELECT series_id, \
+                  COALESCE(string_agg(k || '=' || v, ',' ORDER BY k), '') AS group_key \
+           FROM gk_pairs GROUP BY series_id \
+         ), \
+         grouped AS ( \
+           SELECT gk.group_key, {agg_call} AS agg_v, MIN(latest.series_id) AS rep_sid \
+           FROM latest JOIN gk ON latest.series_id = gk.series_id \
+           GROUP BY gk.group_key \
+         ) \
+         SELECT s.labels, grouped.agg_v \
+         FROM grouped \
+         JOIN {cat}.skaldberg.series s ON grouped.rep_sid = s.series_id"
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("aggregate-without sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("aggregate-without collect: {e}")))?;
+
+    let excluded_set: BTreeSet<&str> = excluded.iter().map(String::as_str).collect();
+    let mut out = Vec::new();
+    for batch in batches {
+        let labels_col = batch.column(0).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("agg-without labels col"))?;
+        let agg_col = batch.column(1).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("agg-without value not Float64"))?;
+        for i in 0..batch.num_rows() {
+            if agg_col.is_null(i) {
+                continue;
+            }
+            let mut labels = labels_to_btree(labels_col, i)?;
+            labels.retain(|k, _| !excluded_set.contains(k.as_str()));
+            out.push(InstantPoint {
+                metric_name: String::new(),
+                labels,
+                ts_us: time_us,
+                value: agg_col.value(i),
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Range counterpart: per-timestamp SQL `GROUP BY` over the
 /// retained labels. No CTE / window function needed since we want
 /// every sample's contribution per timestamp.
@@ -1690,6 +2043,9 @@ async fn range_aggregate_via_sql(
     start_us: i64,
     end_us: i64,
 ) -> Result<Vec<RangePoints>, PromError> {
+    if let Some(excluded) = modifier_excluded_keys(modifier) {
+        return range_aggregate_without_via_sql(state, sel, op, excluded, start_us, end_us).await;
+    }
     let group_keys = aggregate_group_keys(modifier);
 
     let mut conds = selector_predicates(sel);
@@ -1784,6 +2140,111 @@ async fn range_aggregate_via_sql(
         .collect())
 }
 
+/// Matrix counterpart of `instant_aggregate_without_via_sql`: per
+/// `(timestamp, group_key)` aggregation where `group_key` strips
+/// the `without` keys.
+async fn range_aggregate_without_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    op: AggOp,
+    excluded: &[String],
+    start_us: i64,
+    end_us: i64,
+) -> Result<Vec<RangePoints>, PromError> {
+    let mut conds = selector_predicates(sel);
+    conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(start_us),
+        us_to_ts_lit(end_us),
+    ));
+    let where_clause = format!(" WHERE {}", conds.join(" AND "));
+    let excluded_filter = if excluded.is_empty() {
+        "TRUE".to_string()
+    } else {
+        format!("u.k NOT IN ({})", quoted_keys_list(excluded))
+    };
+    let agg_call = agg_call_sql(op, "samples_in_window.value");
+    let cat = DF_CATALOG_NAME;
+
+    let sql = format!(
+        "WITH samples_in_window AS ( \
+           SELECT sa.series_id, sa.timestamp, sa.value \
+           FROM {cat}.skaldberg.samples sa \
+           JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
+           {where_clause} \
+         ), \
+         distinct_sids AS ( \
+           SELECT DISTINCT series_id FROM samples_in_window \
+         ), \
+         gk_pairs AS ( \
+           SELECT u.series_id, u.k AS k, element_at(u.labels, u.k)[1] AS v \
+           FROM ( \
+             SELECT d.series_id, s.labels, unnest(map_keys(s.labels)) AS k \
+             FROM distinct_sids d JOIN {cat}.skaldberg.series s ON d.series_id = s.series_id \
+           ) u \
+           WHERE {excluded_filter} \
+         ), \
+         gk AS ( \
+           SELECT series_id, \
+                  COALESCE(string_agg(k || '=' || v, ',' ORDER BY k), '') AS group_key \
+           FROM gk_pairs GROUP BY series_id \
+         ), \
+         grouped AS ( \
+           SELECT samples_in_window.timestamp, gk.group_key, \
+                  {agg_call} AS agg_v, \
+                  MIN(samples_in_window.series_id) AS rep_sid \
+           FROM samples_in_window \
+           JOIN gk ON samples_in_window.series_id = gk.series_id \
+           GROUP BY samples_in_window.timestamp, gk.group_key \
+         ) \
+         SELECT s.labels, grouped.timestamp, grouped.agg_v \
+         FROM grouped \
+         JOIN {cat}.skaldberg.series s ON grouped.rep_sid = s.series_id \
+         ORDER BY grouped.timestamp"
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("range aggregate-without sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("range aggregate-without collect: {e}")))?;
+
+    let excluded_set: BTreeSet<&str> = excluded.iter().map(String::as_str).collect();
+    let mut by_group: BTreeMap<BTreeMap<String, String>, Vec<(i64, f64)>> = BTreeMap::new();
+    for batch in batches {
+        let labels_col = batch.column(0).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("range agg-without labels col"))?;
+        let ts_col = batch.column(1).as_any().downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or_else(|| PromError::internal("range agg-without ts col"))?;
+        let agg_col = batch.column(2).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("range agg-without value col"))?;
+        for i in 0..batch.num_rows() {
+            if agg_col.is_null(i) {
+                continue;
+            }
+            let mut labels = labels_to_btree(labels_col, i)?;
+            labels.retain(|k, _| !excluded_set.contains(k.as_str()));
+            by_group
+                .entry(labels)
+                .or_default()
+                .push((ts_col.value(i), agg_col.value(i)));
+        }
+    }
+    Ok(by_group
+        .into_iter()
+        .filter(|(_, pts)| !pts.is_empty())
+        .map(|(labels, points)| RangePoints {
+            metric_name: String::new(),
+            labels,
+            points,
+        })
+        .collect())
+}
+
 /// `topk(n, <selector>) [by (...)]` pushed into a single SQL
 /// statement. Two CTEs:
 ///
@@ -1808,6 +2269,9 @@ async fn instant_topk_via_sql(
 ) -> Result<Vec<InstantPoint>, PromError> {
     if n == 0 {
         return Ok(Vec::new());
+    }
+    if let Some(excluded) = modifier_excluded_keys(modifier) {
+        return instant_topk_without_via_sql(state, sel, n, top, excluded, time_us).await;
     }
     let from_us = time_us - LOOKBACK_US;
     let group_keys = aggregate_group_keys(modifier);
@@ -1892,6 +2356,106 @@ async fn instant_topk_via_sql(
     Ok(out)
 }
 
+/// `topk(n, <selector>) without (k1, k2, ...)`: rank `(rate_v)`
+/// within each group, where the group is defined by labels minus
+/// the excluded keys. Group key built via `string_agg` over the
+/// labels MAP excluding the listed keys (same shape the aggregate
+/// path uses). Surviving rows keep `metric_name` and full labels.
+async fn instant_topk_without_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    n: usize,
+    top: bool,
+    excluded: &[String],
+    time_us: i64,
+) -> Result<Vec<InstantPoint>, PromError> {
+    let from_us = time_us - LOOKBACK_US;
+    let mut window_conds = selector_predicates(sel);
+    window_conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(from_us),
+        us_to_ts_lit(time_us),
+    ));
+    let where_clause = format!(" WHERE {}", window_conds.join(" AND "));
+    let excluded_filter = if excluded.is_empty() {
+        "TRUE".to_string()
+    } else {
+        format!("u.k NOT IN ({})", quoted_keys_list(excluded))
+    };
+    let order_dir = if top { "DESC" } else { "ASC" };
+    let cat = DF_CATALOG_NAME;
+
+    let sql = format!(
+        "WITH ws AS ( \
+           SELECT sa.series_id, sa.value, \
+                  ROW_NUMBER() OVER (PARTITION BY sa.series_id ORDER BY sa.timestamp DESC) AS rn \
+           FROM {cat}.skaldberg.samples sa \
+           JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
+           {where_clause} \
+         ), \
+         latest AS ( \
+           SELECT series_id, value FROM ws WHERE rn = 1 \
+         ), \
+         gk_pairs AS ( \
+           SELECT u.series_id, u.k AS k, element_at(u.labels, u.k)[1] AS v \
+           FROM ( \
+             SELECT lt.series_id, s.labels, unnest(map_keys(s.labels)) AS k \
+             FROM latest lt JOIN {cat}.skaldberg.series s ON lt.series_id = s.series_id \
+           ) u \
+           WHERE {excluded_filter} \
+         ), \
+         gk AS ( \
+           SELECT series_id, \
+                  COALESCE(string_agg(k || '=' || v, ',' ORDER BY k), '') AS group_key \
+           FROM gk_pairs GROUP BY series_id \
+         ), \
+         ranked AS ( \
+           SELECT l.series_id, l.value, \
+                  ROW_NUMBER() OVER (PARTITION BY gk.group_key ORDER BY l.value {order_dir}) AS rnk \
+           FROM latest l \
+           JOIN gk ON l.series_id = gk.series_id \
+         ) \
+         SELECT s.metric_name, s.labels, rk.value \
+         FROM ranked rk \
+         JOIN {cat}.skaldberg.series s ON rk.series_id = s.series_id \
+         WHERE rk.rnk <= {n}"
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("topk-without sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("topk-without collect: {e}")))?;
+
+    let label_filters = label_filters_for_selector(sel);
+    let mut out = Vec::new();
+    for batch in batches {
+        let metric_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| PromError::internal("topk-without metric_name col"))?;
+        let labels_col = batch.column(1).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("topk-without labels col"))?;
+        let val_col = batch.column(2).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("topk-without value col"))?;
+        for i in 0..batch.num_rows() {
+            let labels = labels_to_btree(labels_col, i)?;
+            if !label_filters.iter().all(|f| match_label(&labels, f)) {
+                continue;
+            }
+            out.push(InstantPoint {
+                metric_name: metric_col.value(i).to_string(),
+                labels,
+                ts_us: time_us,
+                value: val_col.value(i),
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// `topk(n, <rate-fn>(<selector>[r])) [by (...)]` evaluated as
 /// one SQL plan: per-series rate produced by
 /// `per_series_rangefn_ctes`, then `ROW_NUMBER` partitioned by
@@ -1910,6 +2474,12 @@ async fn instant_topk_over_rangefn_via_sql(
 ) -> Result<Vec<InstantPoint>, PromError> {
     if n == 0 {
         return Ok(Vec::new());
+    }
+    if let Some(excluded) = modifier_excluded_keys(modifier) {
+        return instant_topk_over_rangefn_without_via_sql(
+            state, sel, range_us, fn_op, n, top, excluded, time_us,
+        )
+        .await;
     }
     let from_us = time_us - range_us;
     let mut conds = selector_predicates(sel);
@@ -1990,6 +2560,100 @@ async fn instant_topk_over_rangefn_via_sql(
     Ok(out)
 }
 
+/// `topk(n, <rate-fn>(<sel>[r])) without (k1, k2, ...)`. Rank
+/// `ps.rate_v` within each group (labels minus excluded), output
+/// rows keep `metric_name` and full label MAP.
+async fn instant_topk_over_rangefn_without_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    range_us: i64,
+    fn_op: RangeFnOp,
+    n: usize,
+    top: bool,
+    excluded: &[String],
+    time_us: i64,
+) -> Result<Vec<InstantPoint>, PromError> {
+    let from_us = time_us - range_us;
+    let mut conds = selector_predicates(sel);
+    conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(from_us),
+        us_to_ts_lit(time_us),
+    ));
+    let where_clause = format!("WHERE {}", conds.join(" AND "));
+    let rate_ctes = per_series_rangefn_ctes(fn_op, &where_clause);
+    let excluded_filter = if excluded.is_empty() {
+        "TRUE".to_string()
+    } else {
+        format!("u.k NOT IN ({})", quoted_keys_list(excluded))
+    };
+    let order_dir = if top { "DESC" } else { "ASC" };
+    let cat = DF_CATALOG_NAME;
+
+    let sql = format!(
+        "{rate_ctes}, \
+         gk_pairs AS ( \
+           SELECT u.series_id, u.k AS k, element_at(u.labels, u.k)[1] AS v \
+           FROM ( \
+             SELECT pps.series_id, s.labels, unnest(map_keys(s.labels)) AS k \
+             FROM per_series pps JOIN {cat}.skaldberg.series s ON pps.series_id = s.series_id \
+           ) u \
+           WHERE {excluded_filter} \
+         ), \
+         gk AS ( \
+           SELECT series_id, \
+                  COALESCE(string_agg(k || '=' || v, ',' ORDER BY k), '') AS group_key \
+           FROM gk_pairs GROUP BY series_id \
+         ), \
+         ranked AS ( \
+           SELECT ps.series_id, ps.rate_v, \
+                  ROW_NUMBER() OVER (PARTITION BY gk.group_key ORDER BY ps.rate_v {order_dir}) AS rnk \
+           FROM per_series ps JOIN gk ON ps.series_id = gk.series_id \
+         ) \
+         SELECT s.metric_name, s.labels, rk.rate_v AS value \
+         FROM ranked rk \
+         JOIN {cat}.skaldberg.series s ON rk.series_id = s.series_id \
+         WHERE rk.rnk <= {n}"
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("topk-over-rate-without sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("topk-over-rate-without collect: {e}")))?;
+
+    let label_filters = label_filters_for_selector(sel);
+    let mut out = Vec::new();
+    for batch in batches {
+        let metric_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| PromError::internal("topk-over-rate-without metric_name col"))?;
+        let labels_col = batch.column(1).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("topk-over-rate-without labels col"))?;
+        let val_col = batch.column(2).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("topk-over-rate-without value col"))?;
+        for i in 0..batch.num_rows() {
+            let labels = labels_to_btree(labels_col, i)?;
+            if !label_filters.iter().all(|f| match_label(&labels, f)) {
+                continue;
+            }
+            if val_col.is_null(i) { continue; }
+            let v = val_col.value(i);
+            if !v.is_finite() { continue; }
+            out.push(InstantPoint {
+                metric_name: metric_col.value(i).to_string(),
+                labels,
+                ts_us: time_us,
+                value: v,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Range counterpart: rank within `(timestamp, retained_labels)`
 /// instead of just retained_labels, so each evaluation timestamp
 /// gets its own top-n cut. Output rows are regrouped on the Rust
@@ -2006,6 +2670,9 @@ async fn range_topk_via_sql(
 ) -> Result<Vec<RangePoints>, PromError> {
     if n == 0 {
         return Ok(Vec::new());
+    }
+    if let Some(excluded) = modifier_excluded_keys(modifier) {
+        return range_topk_without_via_sql(state, sel, n, top, excluded, start_us, end_us).await;
     }
     let group_keys = aggregate_group_keys(modifier);
 
@@ -2081,6 +2748,109 @@ async fn range_topk_via_sql(
     Ok(by_series.into_values().collect())
 }
 
+/// Matrix counterpart of `instant_topk_without_via_sql`. Rank
+/// per `(timestamp, group_key)` where `group_key` strips the
+/// excluded labels; output one row per (surviving series, ts)
+/// regrouped on the Rust side by `series_key`.
+async fn range_topk_without_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    n: usize,
+    top: bool,
+    excluded: &[String],
+    start_us: i64,
+    end_us: i64,
+) -> Result<Vec<RangePoints>, PromError> {
+    let mut conds = selector_predicates(sel);
+    conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(start_us),
+        us_to_ts_lit(end_us),
+    ));
+    let where_clause = format!(" WHERE {}", conds.join(" AND "));
+    let excluded_filter = if excluded.is_empty() {
+        "TRUE".to_string()
+    } else {
+        format!("u.k NOT IN ({})", quoted_keys_list(excluded))
+    };
+    let order_dir = if top { "DESC" } else { "ASC" };
+    let cat = DF_CATALOG_NAME;
+
+    let sql = format!(
+        "WITH samples_in_window AS ( \
+           SELECT sa.series_id, sa.timestamp, sa.value \
+           FROM {cat}.skaldberg.samples sa \
+           JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
+           {where_clause} \
+         ), \
+         distinct_sids AS ( \
+           SELECT DISTINCT series_id FROM samples_in_window \
+         ), \
+         gk_pairs AS ( \
+           SELECT u.series_id, u.k AS k, element_at(u.labels, u.k)[1] AS v \
+           FROM ( \
+             SELECT d.series_id, s.labels, unnest(map_keys(s.labels)) AS k \
+             FROM distinct_sids d JOIN {cat}.skaldberg.series s ON d.series_id = s.series_id \
+           ) u \
+           WHERE {excluded_filter} \
+         ), \
+         gk AS ( \
+           SELECT series_id, \
+                  COALESCE(string_agg(k || '=' || v, ',' ORDER BY k), '') AS group_key \
+           FROM gk_pairs GROUP BY series_id \
+         ), \
+         ranked AS ( \
+           SELECT sw.series_id, sw.timestamp, sw.value, \
+                  ROW_NUMBER() OVER (PARTITION BY sw.timestamp, gk.group_key ORDER BY sw.value {order_dir}) AS rnk \
+           FROM samples_in_window sw \
+           JOIN gk ON sw.series_id = gk.series_id \
+         ) \
+         SELECT s.metric_name, s.labels, rk.timestamp, rk.value \
+         FROM ranked rk \
+         JOIN {cat}.skaldberg.series s ON rk.series_id = s.series_id \
+         WHERE rk.rnk <= {n} \
+         ORDER BY s.metric_name, rk.timestamp"
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("range topk-without sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("range topk-without collect: {e}")))?;
+
+    let label_filters = label_filters_for_selector(sel);
+    let mut by_series: BTreeMap<String, RangePoints> = BTreeMap::new();
+    for batch in batches {
+        let metric_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| PromError::internal("range topk-without metric_name col"))?;
+        let labels_col = batch.column(1).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("range topk-without labels col"))?;
+        let ts_col = batch.column(2).as_any().downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or_else(|| PromError::internal("range topk-without ts col"))?;
+        let val_col = batch.column(3).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("range topk-without value col"))?;
+        for i in 0..batch.num_rows() {
+            let labels = labels_to_btree(labels_col, i)?;
+            if !label_filters.iter().all(|f| match_label(&labels, f)) {
+                continue;
+            }
+            let metric = metric_col.value(i).to_string();
+            let key = series_key(&metric, &labels);
+            let entry = by_series.entry(key).or_insert_with(|| RangePoints {
+                metric_name: metric,
+                labels,
+                points: Vec::new(),
+            });
+            entry.points.push((ts_col.value(i), val_col.value(i)));
+        }
+    }
+    Ok(by_series.into_values().collect())
+}
+
 /// Matrix `topk(n, <rate-fn>(<selector>[r])) [by (...)]`. Per-eval
 /// per-series rate from `per_series_rangefn_range_ctes`, then
 /// `ROW_NUMBER` partitioned by `(eval_us, retained_labels)` so
@@ -2099,6 +2869,12 @@ async fn range_topk_over_rangefn_via_sql(
 ) -> Result<Vec<RangePoints>, PromError> {
     if n == 0 {
         return Ok(Vec::new());
+    }
+    if let Some(excluded) = modifier_excluded_keys(modifier) {
+        return range_topk_over_rangefn_without_via_sql(
+            state, sel, range_us, fn_op, n, top, excluded, start_us, end_us, step_us,
+        )
+        .await;
     }
     let mut evals = Vec::new();
     let mut t = start_us;
@@ -2192,6 +2968,129 @@ async fn range_topk_over_rangefn_via_sql(
             if !v.is_finite() {
                 continue;
             }
+            let metric = metric_col.value(i).to_string();
+            let key = series_key(&metric, &labels);
+            let entry = by_series.entry(key).or_insert_with(|| RangePoints {
+                metric_name: metric,
+                labels,
+                points: Vec::new(),
+            });
+            entry.points.push((eval_col.value(i), v));
+        }
+    }
+    Ok(by_series.into_values().collect())
+}
+
+/// Matrix `topk(n, <rate-fn>(<sel>[r])) without (k1, k2, ...)`.
+async fn range_topk_over_rangefn_without_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    range_us: i64,
+    fn_op: RangeFnOp,
+    n: usize,
+    top: bool,
+    excluded: &[String],
+    start_us: i64,
+    end_us: i64,
+    step_us: i64,
+) -> Result<Vec<RangePoints>, PromError> {
+    let mut evals = Vec::new();
+    let mut t = start_us;
+    while t <= end_us {
+        evals.push(t);
+        if evals.len() > MAX_RANGE_EVALS {
+            return Err(PromError::bad_data(format!(
+                "range query produces > {MAX_RANGE_EVALS} eval points; pick a larger step"
+            )));
+        }
+        t = t.saturating_add(step_us);
+    }
+    if evals.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let global_lo = start_us.saturating_sub(range_us);
+    let mut sample_conds = selector_predicates(sel);
+    sample_conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(global_lo),
+        us_to_ts_lit(end_us),
+    ));
+    let sample_where = sample_conds.join(" AND ");
+    let mut values_parts = Vec::with_capacity(evals.len());
+    for v in &evals {
+        values_parts.push(format!("({v})"));
+    }
+    let values_clause = values_parts.join(", ");
+    let rate_ctes = per_series_rangefn_range_ctes(fn_op, range_us, &values_clause, &sample_where);
+    let excluded_filter = if excluded.is_empty() {
+        "TRUE".to_string()
+    } else {
+        format!("u.k NOT IN ({})", quoted_keys_list(excluded))
+    };
+    let order_dir = if top { "DESC" } else { "ASC" };
+    let cat = DF_CATALOG_NAME;
+
+    let sql = format!(
+        "{rate_ctes}, \
+         distinct_sids AS ( \
+           SELECT DISTINCT series_id FROM per_series \
+         ), \
+         gk_pairs AS ( \
+           SELECT u.series_id, u.k AS k, element_at(u.labels, u.k)[1] AS v \
+           FROM ( \
+             SELECT d.series_id, s.labels, unnest(map_keys(s.labels)) AS k \
+             FROM distinct_sids d JOIN {cat}.skaldberg.series s ON d.series_id = s.series_id \
+           ) u \
+           WHERE {excluded_filter} \
+         ), \
+         gk AS ( \
+           SELECT series_id, \
+                  COALESCE(string_agg(k || '=' || v, ',' ORDER BY k), '') AS group_key \
+           FROM gk_pairs GROUP BY series_id \
+         ), \
+         ranked AS ( \
+           SELECT ps.series_id, ps.eval_us, ps.rate_v, \
+                  ROW_NUMBER() OVER (PARTITION BY ps.eval_us, gk.group_key ORDER BY ps.rate_v {order_dir}) AS rnk \
+           FROM per_series ps JOIN gk ON ps.series_id = gk.series_id \
+         ) \
+         SELECT s.metric_name, s.labels, rk.eval_us, rk.rate_v AS value \
+         FROM ranked rk \
+         JOIN {cat}.skaldberg.series s ON rk.series_id = s.series_id \
+         WHERE rk.rnk <= {n} \
+         ORDER BY s.metric_name, rk.eval_us"
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("range topk-over-rate-without sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("range topk-over-rate-without collect: {e}")))?;
+
+    use arrow::array::Int64Array;
+    let label_filters = label_filters_for_selector(sel);
+    let mut by_series: BTreeMap<String, RangePoints> = BTreeMap::new();
+    for batch in batches {
+        let metric_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| PromError::internal("range topk-over-rate-without metric_name col"))?;
+        let labels_col = batch.column(1).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("range topk-over-rate-without labels col"))?;
+        let eval_col = batch.column(2).as_any().downcast_ref::<Int64Array>()
+            .ok_or_else(|| PromError::internal("range topk-over-rate-without eval col"))?;
+        let val_col = batch.column(3).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("range topk-over-rate-without value col"))?;
+        for i in 0..batch.num_rows() {
+            let labels = labels_to_btree(labels_col, i)?;
+            if !label_filters.iter().all(|f| match_label(&labels, f)) {
+                continue;
+            }
+            if val_col.is_null(i) { continue; }
+            let v = val_col.value(i);
+            if !v.is_finite() { continue; }
             let metric = metric_col.value(i).to_string();
             let key = series_key(&metric, &labels);
             let entry = by_series.entry(key).or_insert_with(|| RangePoints {
