@@ -2165,6 +2165,13 @@ async fn binary_range_eval(
         .await;
     }
 
+    if let (Some(lsel), Some(rsel)) = (pure_selector(lhs), pure_selector(rhs)) {
+        return vector_vector_range_via_sql(
+            state, lsel, rsel, op, return_bool, start_us, end_us,
+        )
+        .await;
+    }
+
     let left = eval_side_range(state, lhs, start_us, end_us, step_us).await?;
     let right = eval_side_range(state, rhs, start_us, end_us, step_us).await?;
     Ok(match (left, right) {
@@ -2564,6 +2571,140 @@ async fn vector_vector_instant_via_sql(
 /// referencing the JOINed `j.lhs_v` / `j.rhs_v` columns directly.
 fn cmp_op_sql_pair(op: BinOp) -> String {
     format!("j.lhs_v {} j.rhs_v", cmp_op_sql(op))
+}
+
+/// Matrix counterpart of `vector_side_ctes`: emits all `(series_id,
+/// ts, value)` samples in the window plus a per-series `gk`. The
+/// `<side>_distinct` step gives the gk pipeline one row per series
+/// (rather than one per sample) so `string_agg` doesn't see the
+/// label set repeated for every timestamp.
+fn vector_side_range_ctes(side: &str, sel: &VectorSelector, time_window_clause: &str) -> String {
+    let cat = DF_CATALOG_NAME;
+    let mut conds = selector_predicates(sel);
+    conds.push(time_window_clause.to_string());
+    let where_clause = format!("WHERE {}", conds.join(" AND "));
+
+    format!(
+        "{side}_samples AS ( \
+           SELECT sa.series_id, sa.timestamp AS ts, sa.value + 0.0 AS value \
+           FROM {cat}.skaldberg.samples sa \
+           JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
+           {where_clause} \
+         ), \
+         {side}_distinct AS ( \
+           SELECT DISTINCT series_id FROM {side}_samples \
+         ), \
+         {side}_gk_pairs AS ( \
+           SELECT u.series_id, u.k AS k, element_at(u.labels, u.k)[1] AS v \
+           FROM ( \
+             SELECT d.series_id, s.labels, unnest(map_keys(s.labels)) AS k \
+             FROM {side}_distinct d \
+             JOIN {cat}.skaldberg.series s ON d.series_id = s.series_id \
+           ) u \
+         ), \
+         {side}_gk AS ( \
+           SELECT series_id, \
+                  COALESCE(string_agg(k || '=' || v, ',' ORDER BY k), '') AS group_key \
+           FROM {side}_gk_pairs GROUP BY series_id \
+         )"
+    )
+}
+
+/// Matrix path: `<sel> <op> <sel>` over a time range, with
+/// per-timestamp 1:1 label matching. Same JOIN-on-group_key idea
+/// as the instant path, but the JOIN also matches on `ts`, and
+/// every sample (not just the latest) participates.
+async fn vector_vector_range_via_sql(
+    state: &AppState,
+    lsel: &VectorSelector,
+    rsel: &VectorSelector,
+    op: BinOp,
+    return_bool: bool,
+    start_us: i64,
+    end_us: i64,
+) -> Result<Vec<RangePoints>, PromError> {
+    let time_window = format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(start_us),
+        us_to_ts_lit(end_us),
+    );
+
+    let lhs_ctes = vector_side_range_ctes("lhs", lsel, &time_window);
+    let rhs_ctes = vector_side_range_ctes("rhs", rsel, &time_window);
+
+    let is_filter = op.is_comparison() && !return_bool;
+    let (metric_sel, value_sel, extra_where) = if is_filter {
+        (
+            "s.metric_name".to_string(),
+            "j.lhs_v".to_string(),
+            format!(" AND ({})", cmp_op_sql_pair(op)),
+        )
+    } else {
+        (
+            "''".to_string(),
+            binop_value_sql(op, "j.lhs_v", "j.rhs_v", return_bool),
+            String::new(),
+        )
+    };
+    let cat = DF_CATALOG_NAME;
+
+    let sql = format!(
+        "WITH {lhs_ctes}, {rhs_ctes}, \
+         joined AS ( \
+           SELECT l.series_id AS lhs_sid, l.ts AS ts, l.value AS lhs_v, r.value AS rhs_v \
+           FROM lhs_samples l \
+           JOIN lhs_gk lgk ON l.series_id = lgk.series_id \
+           JOIN rhs_gk rgk ON lgk.group_key = rgk.group_key \
+           JOIN rhs_samples r ON rgk.series_id = r.series_id AND r.ts = l.ts \
+         ) \
+         SELECT {metric_sel} AS m_name, s.labels, j.ts, ({value_sel}) AS value \
+         FROM joined j \
+         JOIN {cat}.skaldberg.series s ON j.lhs_sid = s.series_id \
+         WHERE TRUE{extra_where} \
+         ORDER BY s.metric_name, j.ts"
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("vec-vec range sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("vec-vec range collect: {e}")))?;
+
+    let mut label_filters = label_filters_for_selector(lsel);
+    label_filters.extend(label_filters_for_selector(rsel));
+    let mut by_series: BTreeMap<String, RangePoints> = BTreeMap::new();
+    for batch in batches {
+        let metric_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| PromError::internal("vec-vec range metric_name col"))?;
+        let labels_col = batch.column(1).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("vec-vec range labels col"))?;
+        let ts_col = batch.column(2).as_any().downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or_else(|| PromError::internal("vec-vec range ts col"))?;
+        let val_col = batch.column(3).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("vec-vec range value col"))?;
+        for i in 0..batch.num_rows() {
+            let labels = labels_to_btree(labels_col, i)?;
+            if !label_filters.iter().all(|f| match_label(&labels, f)) {
+                continue;
+            }
+            if val_col.is_null(i) {
+                continue;
+            }
+            let metric = metric_col.value(i).to_string();
+            let key = series_key(&metric, &labels);
+            let entry = by_series.entry(key).or_insert_with(|| RangePoints {
+                metric_name: metric,
+                labels,
+                points: Vec::new(),
+            });
+            entry.points.push((ts_col.value(i), val_col.value(i)));
+        }
+    }
+    Ok(by_series.into_values().collect())
 }
 
 /// Range counterpart: every sample in the time window goes through
