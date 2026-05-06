@@ -9,6 +9,9 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: admin
     volumes:
       - ./provisioning:/etc/grafana/provisioning
+      # Provisioned dashboards live here; the path matches what
+      # provisioning/dashboards/dashboards.yaml expects.
+      - ./dashboards:/etc/grafana/dashboards
     extra_hosts:
       # Grafana runs in Docker; Skaldberg typically runs on the host
       # (`cargo run --release -- --catalog memory ...`). This mapping

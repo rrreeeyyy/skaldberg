@@ -1,11 +1,13 @@
 apiVersion: 1
 
 datasources:
-  # Skaldberg speaks the Prometheus HTTP API subset (selectors +
-  # range vectors; functions are parsed but unwrapped to raw points
-  # in step 1). Grafana's built-in `prometheus` datasource type
-  # talks to it as if it were a vanilla Prometheus server.
+  # Skaldberg speaks the Prometheus HTTP API subset that Grafana's
+  # built-in `prometheus` datasource expects (selectors, aggregations,
+  # rate-family, histogram_quantile, vec×vec, topk — see the README's
+  # "PromQL pushdown" section for the full list). Grafana doesn't
+  # need to know the backend isn't Prometheus.
   - name: Skaldberg
+    uid: skaldberg          # referenced by the provisioned dashboard
     type: prometheus
     access: proxy
     url: http://host.docker.internal:8080
