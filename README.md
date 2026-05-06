@@ -81,11 +81,11 @@ Pushed entirely into SQL (instant + matrix paths):
 | `histogram_quantile(q, rate(bucket[r]))`       | window-based cumulative interpolation           |
 | `<sel> <op> <sel>` (1:1 label match)           | `string_agg`-keyed JOIN                         |
 | `topk(n, rate(metric[r])) [by (...)]`          | ranking over the per-series rate CTE            |
+| `<agg/topk>(...) without (k1, k2, ...)`        | `string_agg` group key over labels minus excluded |
 
 Everything else (or richer variants) falls back to a single SQL fetch
 plus a Rust post-step:
 
-- `without (...)` modifier (would need the full label set up front)
 - `on (...)` / `ignoring (...)` / `group_left` / `group_right` on `vec × vec`
 - nested aggregations (`sum(sum(...))`) and other non-selector inners
 - arbitrary inner expressions on `histogram_quantile`
@@ -212,6 +212,49 @@ SKALDBERG_TABLE_BUCKET_ARN=arn:aws:s3tables:... \
 - **Backpressure.** When the buffer reaches 256 MiB the ingest endpoints
   return 503 so producers retry rather than OOM the server.
 
+## Known limitations
+
+### No row-level retention (waiting on upstream)
+
+Skaldberg has no built-in story for deleting old samples. The
+`samples` table grows for as long as the server ingests, and the
+server itself has no path to issue an Iceberg `DELETE`. Two upstream
+paths could close this; we deliberately don't ship an external
+workaround:
+
+1. **`iceberg-rust`** gains row-level DELETE / `RowDelta`
+   transaction actions. PRs in flight as of 2026-05:
+   [apache/iceberg-rust#2185](https://github.com/apache/iceberg-rust/pull/2185)
+   (CoW `OverwriteAction`),
+   [#2203](https://github.com/apache/iceberg-rust/pull/2203)
+   (`RowDelta` for MoR),
+   [#2367](https://github.com/apache/iceberg-rust/pull/2367)
+   (snapshot producer delete-files). Realistic landing window is
+   the 0.10 or 0.11 release (~mid-2026 if the cadence holds).
+2. **AWS** extends [`PutTableRecordExpirationConfiguration`](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-record-expiration.html)
+   from AWS-managed tables (S3 Storage Lens / SageMaker Catalog) to
+   customer-created S3 Tables. The mechanism, IAM, and console UI
+   exist; coverage extension is not on a published roadmap.
+
+Storage cost without retention scales linearly with ingest
+throughput — roughly **9 GB / year per 100 samples/s** sustained,
+at S3 Tables's `$0.025/GB-month`. At hobby / small-prod scale
+(≤1 k samples/s) the bucket footprint is single-digit dollars per
+year and growing slowly. If retention is a hard requirement before
+either upstream path opens, scheduling an Athena `DELETE FROM
+samples WHERE timestamp < ?` via EventBridge (~$2.5/year for weekly
+cleanup) is technically straightforward but adds an ops piece that
+sits outside skaldberg's "operation-less" surface.
+
+### Other
+
+- `on (...)` / `ignoring (...)` / `group_left` / `group_right` on
+  `vec × vec`: still Rust-side, no pushdown.
+- Real-Prometheus end-to-end smoke (Prometheus remote_write into
+  skaldberg, Grafana dashboard against `/api/v1/query_range`)
+  remains synthetic-data only — see the in-flight Phase 9 dogfood
+  scenario in `examples/grafana/`.
+
 ## Roadmap
 
 Done:
@@ -225,13 +268,12 @@ Done:
 - **Phase 8.** PromQL → SQL pushdown for selectors, aggregations,
   topk/bottomk, scalar × vector, rate-family, `<agg>(rate(...))`,
   `histogram_quantile(q, rate(...))`, vector × vector,
-  `topk(n, rate(...))` — instant + matrix paths. End-to-end verified
-  against a real S3 Tables bucket.
+  `topk(n, rate(...))`, `without (...)` modifier — instant + matrix
+  paths. End-to-end verified against a real S3 Tables bucket.
 
-Open:
-- `without (...)`, `on/ignoring/group_*` modifiers in SQL pushdown.
-- Compaction / retention story for the `samples` and `series` tables.
-- Real Prometheus connection smoke test.
+In progress:
+- **Phase 9.** Dogfood: emit synthetic metrics into skaldberg, view
+  them through Grafana, fix what breaks.
 
 ## License
 
