@@ -169,13 +169,26 @@ fn evaluate_instant<'a>(state: &'a AppState, expr: &'a Expr, time_us: i64) -> In
             }) => {
                 // SQL pushdown is only sound for `by(...)` and "no
                 // modifier"; `without(...)` would need the full label
-                // set up front. The inner expression also has to be a
-                // pure selector — anything richer (rate, binary,
-                // nested aggregation) still goes through the Rust path.
+                // set up front and stays on the Rust path.
                 if aggregate_can_push_down(modifier) {
                     if let Some(sel) = pure_selector(inner) {
                         return instant_aggregate_via_sql(
                             state, sel, op, modifier, time_us,
+                        )
+                        .await;
+                    }
+                    // Two-step pushdown: `<agg>(<rate-fn>(<selector>[r]))`
+                    // — the most common Grafana shape (`sum(rate(...))`).
+                    // Compose the rate-family CTE with an outer GROUP BY
+                    // so the entire pipeline runs in DataFusion.
+                    if let Some(QueryKind::RangeFn {
+                        sel,
+                        range_us,
+                        op: fn_op,
+                    }) = detect_query_kind(inner)
+                    {
+                        return instant_aggregate_over_rangefn_via_sql(
+                            state, sel, range_us, fn_op, op, modifier, time_us,
                         )
                         .await;
                     }
@@ -335,6 +348,147 @@ async fn instant_range_fn_via_sql(
 /// timestamp span; they emit nothing for series that don't qualify.
 fn build_range_fn_sql(op: RangeFnOp, where_clause: &str) -> String {
     let cat = DF_CATALOG_NAME;
+    let ctes = per_series_rangefn_ctes(op, where_clause);
+    format!(
+        "{ctes} \
+         SELECT s.metric_name, s.labels, ps.rate_v AS v \
+         FROM per_series ps \
+         JOIN {cat}.skaldberg.series s ON ps.series_id = s.series_id"
+    )
+}
+
+/// `<agg>(rate(m[r])) [by (...)]` and friends, evaluated as a
+/// single SQL plan: per-series rate produced by
+/// `per_series_rangefn_ctes`, wrapped in an outer `GROUP BY` over
+/// the retained labels. Output one row per group; `__name__` is
+/// stripped (aggregation strips it).
+async fn instant_aggregate_over_rangefn_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    range_us: i64,
+    fn_op: RangeFnOp,
+    agg_op: AggOp,
+    modifier: Option<&LabelModifier>,
+    time_us: i64,
+) -> Result<Vec<InstantPoint>, PromError> {
+    let from_us = time_us - range_us;
+    let mut conds = selector_predicates(sel);
+    conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(from_us),
+        us_to_ts_lit(time_us),
+    ));
+    let where_clause = format!("WHERE {}", conds.join(" AND "));
+
+    let ctes = per_series_rangefn_ctes(fn_op, &where_clause);
+
+    let group_keys = aggregate_group_keys(modifier);
+    let label_exprs: Vec<String> = group_keys
+        .iter()
+        .map(|k| format!("element_at(s.labels, '{}')[1]", sql_escape(k)))
+        .collect();
+    let select_label_part = if label_exprs.is_empty() {
+        String::new()
+    } else {
+        let mut parts: Vec<String> = Vec::with_capacity(label_exprs.len());
+        for (i, e) in label_exprs.iter().enumerate() {
+            parts.push(format!("{e} AS lbl_{i}"));
+        }
+        format!("{}, ", parts.join(", "))
+    };
+    let group_by_clause = if label_exprs.is_empty() {
+        String::new()
+    } else {
+        format!(" GROUP BY {}", label_exprs.join(", "))
+    };
+    let agg_call = agg_call_sql(agg_op, "ps.rate_v");
+    let cat = DF_CATALOG_NAME;
+
+    let sql = format!(
+        "{ctes} \
+         SELECT {select_label_part}{agg_call} AS agg_v \
+         FROM per_series ps \
+         JOIN {cat}.skaldberg.series s ON ps.series_id = s.series_id\
+         {group_by_clause}"
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("agg-over-rate sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("agg-over-rate collect: {e}")))?;
+
+    let label_count = group_keys.len();
+    let mut out = Vec::new();
+    for batch in batches {
+        let agg_col = batch
+            .column(label_count)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("agg-over-rate value not Float64"))?;
+        let mut label_arrays: Vec<&StringArray> = Vec::with_capacity(label_count);
+        for li in 0..label_count {
+            let arr = batch
+                .column(li)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| PromError::internal("agg-over-rate label col not Utf8"))?;
+            label_arrays.push(arr);
+        }
+        for i in 0..batch.num_rows() {
+            if agg_col.is_null(i) {
+                continue;
+            }
+            let v = agg_col.value(i);
+            if !v.is_finite() {
+                continue;
+            }
+            let mut labels = BTreeMap::new();
+            for (li, key) in group_keys.iter().enumerate() {
+                if !label_arrays[li].is_null(i) {
+                    labels.insert(key.clone(), label_arrays[li].value(i).to_string());
+                }
+            }
+            out.push(InstantPoint {
+                metric_name: String::new(),
+                labels,
+                ts_us: time_us,
+                value: v,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Build the CTE chain that yields one `(series_id, rate_v)` row
+/// per series for a range-function call over the time window
+/// captured in `where_clause`. Reused by:
+///   - `build_range_fn_sql` (instant `rate(...)` etc), which adds a
+///     final `SELECT s.metric_name, s.labels, ps.rate_v` on top.
+///   - `instant_aggregate_over_rangefn_via_sql` (`sum(rate(...)) by (...)`),
+///     which wraps it in an outer `GROUP BY` instead.
+///
+/// All three op shapes share the same `base` CTE: re-projects
+/// `sa.value + 0.0` and `CAST(timestamp AS BIGINT)` so window
+/// functions don't trip DataFusion 52's Parquet field-id metadata
+/// mismatch. Per-series filtering (`n >= 2`, `span > 0`) is
+/// applied inside `per_series` so consumers don't need to repeat it.
+fn per_series_rangefn_ctes(op: RangeFnOp, where_clause: &str) -> String {
+    let cat = DF_CATALOG_NAME;
+    let base_cte = format!(
+        "base AS ( \
+           SELECT sa.series_id, \
+                  CAST(sa.timestamp AS BIGINT) AS ts_us, \
+                  sa.value + 0.0 AS value \
+           FROM {cat}.skaldberg.samples sa \
+           JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
+           {where_clause} \
+         )"
+    );
     match op {
         RangeFnOp::Rate | RangeFnOp::Increase => {
             let value_expr = if matches!(op, RangeFnOp::Rate) {
@@ -342,21 +496,8 @@ fn build_range_fn_sql(op: RangeFnOp, where_clause: &str) -> String {
             } else {
                 "total_delta"
             };
-            // `base` re-projects sa.value as `value + 0.0` and the
-            // timestamp through `CAST(... AS BIGINT)` so the resulting
-            // columns lose the Parquet `field_id` metadata. Without
-            // this DataFusion 52's `LAG()` planner trips a logical-vs-
-            // physical schema mismatch (apache/datafusion#…) when the
-            // window input still carries the original Parquet metadata.
             format!(
-                "WITH base AS ( \
-                   SELECT sa.series_id, \
-                          CAST(sa.timestamp AS BIGINT) AS ts_us, \
-                          sa.value + 0.0 AS value \
-                   FROM {cat}.skaldberg.samples sa \
-                   JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
-                   {where_clause} \
-                 ), \
+                "WITH {base_cte}, \
                  adjusted AS ( \
                    SELECT series_id, ts_us, value, \
                           LAG(value) OVER w AS prev_v \
@@ -375,28 +516,17 @@ fn build_range_fn_sql(op: RangeFnOp, where_clause: &str) -> String {
                           COUNT(*) AS n \
                    FROM adjusted \
                    GROUP BY series_id \
-                 ) \
-                 SELECT s.metric_name, s.labels, ({value_expr}) AS v \
-                 FROM agg a \
-                 JOIN {cat}.skaldberg.series s ON a.series_id = s.series_id \
-                 WHERE a.n >= 2 AND a.last_ts_us > a.first_ts_us"
+                 ), \
+                 per_series AS ( \
+                   SELECT series_id, ({value_expr}) AS rate_v \
+                   FROM agg \
+                   WHERE n >= 2 AND last_ts_us > first_ts_us \
+                 )"
             )
         }
         RangeFnOp::Irate => {
-            // Pick rn_desc=1 (the latest sample) and pair it with
-            // the immediately preceding sample via `LAG()` — that's
-            // already the "prev" by construction since LAG is over
-            // ASC ordering. total_n ≥ 2 guarantees prev exists.
-            // `base` strips Parquet field metadata (see Rate path).
             format!(
-                "WITH base AS ( \
-                   SELECT sa.series_id, \
-                          CAST(sa.timestamp AS BIGINT) AS ts_us, \
-                          sa.value + 0.0 AS value \
-                   FROM {cat}.skaldberg.samples sa \
-                   JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
-                   {where_clause} \
-                 ), \
+                "WITH {base_cte}, \
                  ranked AS ( \
                    SELECT series_id, ts_us, value, \
                           LAG(value) OVER w AS prev_v, \
@@ -405,28 +535,18 @@ fn build_range_fn_sql(op: RangeFnOp, where_clause: &str) -> String {
                           COUNT(*) OVER (PARTITION BY series_id) AS total_n \
                    FROM base \
                    WINDOW w AS (PARTITION BY series_id ORDER BY ts_us) \
-                 ) \
-                 SELECT s.metric_name, s.labels, \
-                        ((CASE WHEN value >= prev_v THEN value - prev_v ELSE value END) * 1000000.0 / (ts_us - prev_ts_us)) AS v \
-                 FROM ranked r \
-                 JOIN {cat}.skaldberg.series s ON r.series_id = s.series_id \
-                 WHERE r.rn_desc = 1 AND r.total_n >= 2 AND r.ts_us > r.prev_ts_us"
+                 ), \
+                 per_series AS ( \
+                   SELECT series_id, \
+                          ((CASE WHEN value >= prev_v THEN value - prev_v ELSE value END) * 1000000.0 / (ts_us - prev_ts_us)) AS rate_v \
+                   FROM ranked \
+                   WHERE rn_desc = 1 AND total_n >= 2 AND ts_us > prev_ts_us \
+                 )"
             )
         }
         RangeFnOp::Delta => {
-            // Two ROW_NUMBER passes per partition: ASC for the first
-            // sample, DESC for the last. Join the two sides on
-            // series_id and subtract. `base` strips Parquet field
-            // metadata so window functions plan cleanly.
             format!(
-                "WITH base AS ( \
-                   SELECT sa.series_id, \
-                          CAST(sa.timestamp AS BIGINT) AS ts_us, \
-                          sa.value + 0.0 AS value \
-                   FROM {cat}.skaldberg.samples sa \
-                   JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
-                   {where_clause} \
-                 ), \
+                "WITH {base_cte}, \
                  ranked AS ( \
                    SELECT series_id, value, \
                           ROW_NUMBER() OVER (PARTITION BY series_id ORDER BY ts_us ASC) AS rn_asc, \
@@ -439,12 +559,13 @@ fn build_range_fn_sql(op: RangeFnOp, where_clause: &str) -> String {
                  ), \
                  last_v AS ( \
                    SELECT series_id, value AS last_val FROM ranked WHERE rn_desc = 1 \
-                 ) \
-                 SELECT s.metric_name, s.labels, (l.last_val - e.first_v) AS v \
-                 FROM endpoints e \
-                 JOIN last_v l ON e.series_id = l.series_id \
-                 JOIN {cat}.skaldberg.series s ON e.series_id = s.series_id \
-                 WHERE e.total_n >= 2"
+                 ), \
+                 per_series AS ( \
+                   SELECT e.series_id, (l.last_val - e.first_v) AS rate_v \
+                   FROM endpoints e \
+                   JOIN last_v l ON e.series_id = l.series_id \
+                   WHERE e.total_n >= 2 \
+                 )"
             )
         }
     }
