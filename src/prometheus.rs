@@ -197,6 +197,24 @@ fn evaluate_instant<'a>(state: &'a AppState, expr: &'a Expr, time_us: i64) -> In
                 Ok(aggregate_instant_points(inner_pts, op, modifier, time_us))
             }
             Some(QueryKind::HistogramQuantile { quantile, inner }) => {
+                // SQL pushdown: 0 < q < 1 with a RangeFn inner over a
+                // pure selector — covers the standard
+                // `histogram_quantile(<q>, rate(<bucket>[r]))` shape.
+                // Edge-case quantiles (≤0, ≥1, NaN) and richer inner
+                // shapes stay on the Rust path.
+                if quantile.is_finite() && quantile > 0.0 && quantile < 1.0 {
+                    if let Some(QueryKind::RangeFn {
+                        sel,
+                        range_us,
+                        op: fn_op,
+                    }) = detect_query_kind(inner)
+                    {
+                        return instant_histogram_quantile_via_sql(
+                            state, sel, range_us, fn_op, quantile, time_us,
+                        )
+                        .await;
+                    }
+                }
                 let inner_pts = evaluate_instant(state, inner, time_us).await?;
                 Ok(histogram_quantile_instant(inner_pts, quantile, time_us))
             }
@@ -453,6 +471,161 @@ async fn instant_aggregate_over_rangefn_via_sql(
                     labels.insert(key.clone(), label_arrays[li].value(i).to_string());
                 }
             }
+            out.push(InstantPoint {
+                metric_name: String::new(),
+                labels,
+                ts_us: time_us,
+                value: v,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// `histogram_quantile(<q>, <rate-fn>(<selector>[r]))` evaluated
+/// entirely in SQL.
+///
+/// Pipeline (one SQL plan):
+///   1. `per_series_rangefn_ctes` produces `(series_id, rate_v)`
+///      per bucket-series — same chain the bare rate path uses.
+///   2. `buckets` filters to series carrying an `le` label and
+///      parses it as DOUBLE (with `+Inf` / `-inf` literal handling).
+///      `TRY_CAST` drops series with non-numeric `le` rather than
+///      failing the whole query.
+///   3. Build a stable `group_key` from the labels MAP minus `le`
+///      via `string_agg(k || '=' || v ORDER BY k)`. Series sharing
+///      the same dimensional labels (job/instance/etc.) collapse
+///      into one quantile group.
+///   4. Window functions `LAG(le)`, `LAG(cum)`, and
+///      `MAX(cum) OVER PARTITION BY group_key` give each row its
+///      previous bucket boundary, previous cumulative count, and
+///      the group total — everything Prometheus's
+///      `quantile_from_buckets` needs for linear interpolation.
+///   5. The crossing bucket is the smallest `rn` per group whose
+///      `cum >= q * total`. Interpolate between (prev_le, prev_cum)
+///      and (le, cum) the same way the Rust impl does, with the
+///      same `+Inf` and zero-bucket-count guards.
+/// Aggregations strip `__name__` per Prometheus convention; the
+/// `le` label is also stripped from the output (it identified the
+/// bucket boundary, not a dimension of the result).
+async fn instant_histogram_quantile_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    range_us: i64,
+    fn_op: RangeFnOp,
+    quantile: f64,
+    time_us: i64,
+) -> Result<Vec<InstantPoint>, PromError> {
+    let from_us = time_us - range_us;
+    let mut conds = selector_predicates(sel);
+    conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(from_us),
+        us_to_ts_lit(time_us),
+    ));
+    let where_clause = format!("WHERE {}", conds.join(" AND "));
+
+    let rate_ctes = per_series_rangefn_ctes(fn_op, &where_clause);
+    let cat = DF_CATALOG_NAME;
+    let q = quantile;
+
+    let sql = format!(
+        "{rate_ctes}, \
+         buckets AS ( \
+           SELECT ps.series_id, s.labels, ps.rate_v AS cum, \
+                  TRY_CAST( \
+                    CASE \
+                      WHEN lower(element_at(s.labels, 'le')[1]) IN ('+inf', 'inf') THEN 'Infinity' \
+                      WHEN lower(element_at(s.labels, 'le')[1]) = '-inf' THEN '-Infinity' \
+                      ELSE element_at(s.labels, 'le')[1] \
+                    END AS DOUBLE \
+                  ) AS le \
+           FROM per_series ps \
+           JOIN {cat}.skaldberg.series s ON ps.series_id = s.series_id \
+           WHERE element_at(s.labels, 'le') IS NOT NULL \
+         ), \
+         filtered_buckets AS ( \
+           SELECT * FROM buckets WHERE le IS NOT NULL \
+         ), \
+         gk_pairs AS ( \
+           SELECT u.series_id, u.k AS k, element_at(u.labels, u.k)[1] AS v \
+           FROM ( \
+             SELECT series_id, labels, unnest(map_keys(labels)) AS k \
+             FROM filtered_buckets \
+           ) u \
+           WHERE u.k != 'le' \
+         ), \
+         gk AS ( \
+           SELECT series_id, \
+                  string_agg(k || '=' || v, ',' ORDER BY k) AS group_key \
+           FROM gk_pairs GROUP BY series_id \
+         ), \
+         annotated AS ( \
+           SELECT b.series_id, b.cum, b.le, \
+                  COALESCE(gk.group_key, '') AS group_key \
+           FROM filtered_buckets b LEFT JOIN gk ON b.series_id = gk.series_id \
+         ), \
+         ranked AS ( \
+           SELECT series_id, group_key, le, cum, \
+                  LAG(le) OVER w AS prev_le, \
+                  LAG(cum) OVER w AS prev_cum, \
+                  MAX(cum) OVER (PARTITION BY group_key) AS total, \
+                  ROW_NUMBER() OVER w AS rn \
+           FROM annotated \
+           WINDOW w AS (PARTITION BY group_key ORDER BY le) \
+         ), \
+         rep AS ( \
+           SELECT group_key, MIN(series_id) AS rep_series_id \
+           FROM ranked GROUP BY group_key \
+         ), \
+         crossing AS ( \
+           SELECT group_key, MIN(rn) AS first_rn \
+           FROM ranked \
+           WHERE total > 0 AND cum >= {q} * total \
+           GROUP BY group_key \
+         ) \
+         SELECT s.labels, \
+                CASE \
+                  WHEN r.le = CAST('Infinity' AS DOUBLE) THEN COALESCE(r.prev_le, 0.0) \
+                  WHEN r.cum - COALESCE(r.prev_cum, 0.0) <= 0 THEN r.le \
+                  ELSE COALESCE(r.prev_le, 0.0) \
+                       + (({q} * r.total - COALESCE(r.prev_cum, 0.0)) / (r.cum - COALESCE(r.prev_cum, 0.0))) \
+                         * (r.le - COALESCE(r.prev_le, 0.0)) \
+                END AS qv \
+         FROM crossing c \
+         JOIN ranked r ON c.group_key = r.group_key AND c.first_rn = r.rn \
+         JOIN rep ON c.group_key = rep.group_key \
+         JOIN {cat}.skaldberg.series s ON rep.rep_series_id = s.series_id"
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("hist_quantile sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("hist_quantile collect: {e}")))?;
+
+    let mut out = Vec::new();
+    for batch in batches {
+        let labels_col = batch.column(0).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("hist_quantile labels col"))?;
+        let qv_col = batch.column(1).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("hist_quantile qv col"))?;
+        for i in 0..batch.num_rows() {
+            if qv_col.is_null(i) {
+                continue;
+            }
+            let v = qv_col.value(i);
+            if !v.is_finite() {
+                continue;
+            }
+            let mut labels = labels_to_btree(labels_col, i)?;
+            // `le` identified the bucket boundary, not a dimension
+            // of the quantile result — strip it before emitting.
+            labels.remove("le");
             out.push(InstantPoint {
                 metric_name: String::new(),
                 labels,
