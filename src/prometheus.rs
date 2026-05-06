@@ -154,9 +154,11 @@ fn evaluate_instant<'a>(state: &'a AppState, expr: &'a Expr, time_us: i64) -> In
     Box::pin(async move {
         match detect_query_kind(expr) {
             Some(QueryKind::Selector(sel)) => instant_selector(state, sel, time_us).await,
-            Some(QueryKind::Rate { sel, range_us }) => {
-                instant_rate(state, sel, range_us, time_us).await
-            }
+            Some(QueryKind::RangeFn {
+                sel,
+                range_us,
+                op,
+            }) => instant_range_fn(state, sel, range_us, op, time_us).await,
             Some(QueryKind::Aggregate {
                 op,
                 modifier,
@@ -198,10 +200,11 @@ async fn instant_selector(
         .collect())
 }
 
-async fn instant_rate(
+async fn instant_range_fn(
     state: &AppState,
     sel: &VectorSelector,
     range_us: i64,
+    op: RangeFnOp,
     time_us: i64,
 ) -> Result<Vec<InstantPoint>, PromError> {
     let from_us = time_us - range_us;
@@ -210,12 +213,12 @@ async fn instant_rate(
     let mut out = Vec::new();
     for (_, (metric_name, labels, mut points)) in by_series {
         points.sort_by_key(|(t, _)| *t);
-        if let Some(rate) = compute_rate(&points) {
+        if let Some(v) = compute_range_fn(&points, op) {
             out.push(InstantPoint {
                 metric_name,
                 labels,
                 ts_us: time_us,
-                value: rate,
+                value: v,
             });
         }
     }
@@ -318,9 +321,11 @@ fn evaluate_range<'a>(
             Some(QueryKind::Selector(sel)) => {
                 range_selector(state, sel, start_us, end_us).await
             }
-            Some(QueryKind::Rate { sel, range_us }) => {
-                range_rate(state, sel, range_us, start_us, end_us, step_us).await
-            }
+            Some(QueryKind::RangeFn {
+                sel,
+                range_us,
+                op,
+            }) => range_range_fn(state, sel, range_us, op, start_us, end_us, step_us).await,
             Some(QueryKind::Aggregate {
                 op,
                 modifier,
@@ -353,10 +358,11 @@ async fn range_selector(
         .collect())
 }
 
-async fn range_rate(
+async fn range_range_fn(
     state: &AppState,
     sel: &VectorSelector,
     range_us: i64,
+    op: RangeFnOp,
     start_us: i64,
     end_us: i64,
     step_us: i64,
@@ -378,8 +384,8 @@ async fn range_rate(
             let lo = points.partition_point(|(ts, _)| *ts < lo_ts);
             let hi = points.partition_point(|(ts, _)| *ts <= t);
             if hi.saturating_sub(lo) >= 2 {
-                if let Some(rate) = compute_rate(&points[lo..hi]) {
-                    series_points.push((t, rate));
+                if let Some(v) = compute_range_fn(&points[lo..hi], op) {
+                    series_points.push((t, v));
                 }
             }
             t += step_us;
@@ -471,17 +477,63 @@ fn group_rows_by_series(
     by_series
 }
 
-/// PromQL-style `rate` over an ascending-sorted slice of (ts_us, value).
+/// Apply a range-vector function to a sorted slice of (ts_us, value).
 ///
-/// Returns `delta / seconds`, where `delta` accounts for counter
-/// resets in the same way Prometheus's `delta`/`rate` do *internally*
-/// — at every drop (`curr < prev`) we treat `curr` as a fresh value
-/// counted from zero, instead of letting a reset register as a huge
-/// negative spike. We do **not** apply Prometheus's extrapolation
-/// to the range edges, so on short windows numbers will differ
-/// slightly from a real Prometheus server. Panel rendering and
-/// magnitude are correct.
-fn compute_rate(points: &[(i64, f64)]) -> Option<f64> {
+/// We do **not** apply Prometheus's extrapolation to the range edges
+/// for `rate / increase`, so on short windows numbers will differ
+/// slightly from a real Prometheus server. Magnitudes and shapes are
+/// correct, which is what panels need.
+fn compute_range_fn(points: &[(i64, f64)], op: RangeFnOp) -> Option<f64> {
+    match op {
+        RangeFnOp::Rate => {
+            let (delta, secs) = delta_with_reset_and_secs(points)?;
+            Some(delta / secs)
+        }
+        RangeFnOp::Increase => {
+            // Same `delta` as rate; just don't divide by time.
+            // Equivalent to `rate * range_secs` — Prometheus
+            // documents it that way.
+            let (delta, _) = delta_with_reset_and_secs(points)?;
+            Some(delta)
+        }
+        RangeFnOp::Irate => {
+            // Per-second rate from only the last two samples in the
+            // window. Used for "show me the most recent slope" panels.
+            let n = points.len();
+            if n < 2 {
+                return None;
+            }
+            let (prev_ts, prev_v) = points[n - 2];
+            let (curr_ts, curr_v) = points[n - 1];
+            let secs = (curr_ts - prev_ts) as f64 / 1_000_000.0;
+            if secs <= 0.0 {
+                return None;
+            }
+            let delta = if curr_v >= prev_v {
+                curr_v - prev_v
+            } else {
+                // Counter-reset adjustment, same as in rate.
+                curr_v
+            };
+            Some(delta / secs)
+        }
+        RangeFnOp::Delta => {
+            // Gauge delta: trust the values, don't reset-adjust.
+            // For counters use `increase` instead.
+            if points.len() < 2 {
+                return None;
+            }
+            let first = points.first()?.1;
+            let last = points.last()?.1;
+            Some(last - first)
+        }
+    }
+}
+
+/// Walk an ascending-sorted slice pairwise, summing positive deltas
+/// and treating each drop as `curr` (counter-reset adjustment).
+/// Returns `(delta, seconds_between_first_and_last)`.
+fn delta_with_reset_and_secs(points: &[(i64, f64)]) -> Option<(f64, f64)> {
     if points.len() < 2 {
         return None;
     }
@@ -498,12 +550,12 @@ fn compute_rate(points: &[(i64, f64)]) -> Option<f64> {
         if curr >= prev {
             delta += curr - prev;
         } else {
-            // Counter reset: assume the underlying counter went 0 →
-            // curr in the gap. Equivalent to `curr - 0`.
+            // Counter reset — assume the underlying counter went
+            // 0 → curr in the gap.
             delta += curr;
         }
     }
-    Some(delta / secs)
+    Some((delta, secs))
 }
 
 // ---------- /api/v1/labels ----------
@@ -707,10 +759,12 @@ struct SeriesRow {
 enum QueryKind<'a> {
     /// Return raw points for the wrapped vector selector.
     Selector(&'a VectorSelector),
-    /// Compute Prometheus-style rate over the inner matrix selector.
-    Rate {
+    /// Apply a per-second / per-window function (rate / irate /
+    /// increase / delta) to samples in the matrix selector's range.
+    RangeFn {
         sel: &'a VectorSelector,
         range_us: i64,
+        op: RangeFnOp,
     },
     /// Aggregate the inner expression's results, optionally grouped
     /// by/without a label set.
@@ -719,6 +773,22 @@ enum QueryKind<'a> {
         modifier: Option<&'a LabelModifier>,
         inner: &'a Expr,
     },
+}
+
+#[derive(Clone, Copy)]
+enum RangeFnOp {
+    /// `rate(matrix)` — Prometheus per-second rate, counter-reset
+    /// adjusted, no extrapolation.
+    Rate,
+    /// `irate(matrix)` — instantaneous rate from the last two points
+    /// in the window.
+    Irate,
+    /// `increase(matrix)` — counter-reset-adjusted total delta over
+    /// the window. Equivalent to `rate * range_secs` in our impl.
+    Increase,
+    /// `delta(matrix)` — gauge delta (`last - first`). No counter
+    /// reset adjustment.
+    Delta,
 }
 
 #[derive(Clone, Copy)]
@@ -745,18 +815,29 @@ fn detect_query_kind(expr: &Expr) -> Option<QueryKind<'_>> {
         // through to selector unwrap so the panel still draws something.
     }
     if let Expr::Call(c) = expr {
-        if c.func.name.eq_ignore_ascii_case("rate") {
+        if let Some(op) = parse_range_fn_op(&c.func.name) {
             if let Some(arg) = c.args.args.first() {
                 if let Expr::MatrixSelector(m) = arg.as_ref() {
-                    return Some(QueryKind::Rate {
+                    return Some(QueryKind::RangeFn {
                         sel: &m.vs,
                         range_us: m.range.as_micros() as i64,
+                        op,
                     });
                 }
             }
         }
     }
     extract_selector(expr).map(QueryKind::Selector)
+}
+
+fn parse_range_fn_op(name: &str) -> Option<RangeFnOp> {
+    match name.to_ascii_lowercase().as_str() {
+        "rate" => Some(RangeFnOp::Rate),
+        "irate" => Some(RangeFnOp::Irate),
+        "increase" => Some(RangeFnOp::Increase),
+        "delta" => Some(RangeFnOp::Delta),
+        _ => None,
+    }
 }
 
 fn parse_agg_op(id: u8) -> Option<AggOp> {
