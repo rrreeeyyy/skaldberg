@@ -193,6 +193,19 @@ fn evaluate_instant<'a>(state: &'a AppState, expr: &'a Expr, time_us: i64) -> In
                 modifier,
                 inner,
             }) => {
+                // Same pushdown criteria as `Aggregate`: pure selector
+                // inner + None / `by(...)` modifier. `without(...)`
+                // would need the full label set up front, and a
+                // non-selector inner (e.g. `topk(3, rate(m[1m]))`)
+                // still goes through the Rust path.
+                if aggregate_can_push_down(modifier) {
+                    if let Some(sel) = pure_selector(inner) {
+                        return instant_topk_via_sql(
+                            state, sel, n, top, modifier, time_us,
+                        )
+                        .await;
+                    }
+                }
                 let inner_pts = evaluate_instant(state, inner, time_us).await?;
                 Ok(topk_instant_points(inner_pts, n, top, modifier))
             }
@@ -389,6 +402,14 @@ fn evaluate_range<'a>(
                 modifier,
                 inner,
             }) => {
+                if aggregate_can_push_down(modifier) {
+                    if let Some(sel) = pure_selector(inner) {
+                        return range_topk_via_sql(
+                            state, sel, n, top, modifier, start_us, end_us,
+                        )
+                        .await;
+                    }
+                }
                 let inner_series =
                     evaluate_range(state, inner, start_us, end_us, step_us).await?;
                 Ok(topk_range_points(inner_series, n, top, modifier))
@@ -729,6 +750,205 @@ async fn range_aggregate_via_sql(
             points,
         })
         .collect())
+}
+
+/// `topk(n, <selector>) [by (...)]` pushed into a single SQL
+/// statement. Two CTEs:
+///
+///   `latest` — pick the most recent sample per series within the
+///              5-minute lookback window (same shape as the
+///              aggregate-pushdown CTE).
+///   `ranked` — `ROW_NUMBER()` partitioned by the retained labels,
+///              ordered by value DESC (topk) or ASC (bottomk),
+///              then filter `WHERE rnk <= n`.
+///
+/// Unlike reductive aggregations, topk is a *filter*: surviving
+/// series keep their full `metric_name` and label map intact, so we
+/// `SELECT s.metric_name, s.labels` after the rank cut and decode
+/// the labels MAP exactly the way `run_selector_query` does.
+async fn instant_topk_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    n: usize,
+    top: bool,
+    modifier: Option<&LabelModifier>,
+    time_us: i64,
+) -> Result<Vec<InstantPoint>, PromError> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let from_us = time_us - LOOKBACK_US;
+    let group_keys = aggregate_group_keys(modifier);
+
+    let mut window_conds = selector_predicates(sel);
+    window_conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(from_us),
+        us_to_ts_lit(time_us),
+    ));
+    let window_where = format!(" WHERE {}", window_conds.join(" AND "));
+
+    let label_exprs: Vec<String> = group_keys
+        .iter()
+        .map(|k| format!("element_at(s.labels, '{}')[1]", sql_escape(k)))
+        .collect();
+    // Empty PARTITION BY (no `by`) ranks globally — DataFusion accepts
+    // `ROW_NUMBER() OVER (ORDER BY ...)` without a PARTITION clause.
+    let partition_clause = if label_exprs.is_empty() {
+        String::new()
+    } else {
+        format!("PARTITION BY {} ", label_exprs.join(", "))
+    };
+    let order_dir = if top { "DESC" } else { "ASC" };
+
+    let sql = format!(
+        "WITH latest AS ( \
+           SELECT sa.series_id, sa.value, \
+                  ROW_NUMBER() OVER (PARTITION BY sa.series_id ORDER BY sa.timestamp DESC) AS rn \
+           FROM {cat}.skaldberg.samples sa \
+           JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
+           {window_where} \
+         ), \
+         ranked AS ( \
+           SELECT l.series_id, l.value, \
+                  ROW_NUMBER() OVER ({partition_clause}ORDER BY l.value {order_dir}) AS rnk \
+           FROM latest l \
+           JOIN {cat}.skaldberg.series s ON l.series_id = s.series_id \
+           WHERE l.rn = 1 \
+         ) \
+         SELECT s.metric_name, s.labels, rk.value \
+         FROM ranked rk \
+         JOIN {cat}.skaldberg.series s ON rk.series_id = s.series_id \
+         WHERE rk.rnk <= {n}",
+        cat = DF_CATALOG_NAME,
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("topk sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("topk collect: {e}")))?;
+
+    let label_filters = label_filters_for_selector(sel);
+    let mut out = Vec::new();
+    for batch in batches {
+        let metric_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| PromError::internal("topk metric_name col"))?;
+        let labels_col = batch.column(1).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("topk labels col"))?;
+        let val_col = batch.column(2).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("topk value col"))?;
+        for i in 0..batch.num_rows() {
+            let labels = labels_to_btree(labels_col, i)?;
+            // Apply regex matchers as a Rust post-filter — same
+            // safety net as `run_selector_query`.
+            if !label_filters.iter().all(|f| match_label(&labels, f)) {
+                continue;
+            }
+            out.push(InstantPoint {
+                metric_name: metric_col.value(i).to_string(),
+                labels,
+                ts_us: time_us,
+                value: val_col.value(i),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Range counterpart: rank within `(timestamp, retained_labels)`
+/// instead of just retained_labels, so each evaluation timestamp
+/// gets its own top-n cut. Output rows are regrouped on the Rust
+/// side by `series_key(metric_name, labels)` since a series may
+/// surface in some timestamps and not others.
+async fn range_topk_via_sql(
+    state: &AppState,
+    sel: &VectorSelector,
+    n: usize,
+    top: bool,
+    modifier: Option<&LabelModifier>,
+    start_us: i64,
+    end_us: i64,
+) -> Result<Vec<RangePoints>, PromError> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let group_keys = aggregate_group_keys(modifier);
+
+    let mut conds = selector_predicates(sel);
+    conds.push(format!(
+        "sa.timestamp BETWEEN TIMESTAMP '{}' AND TIMESTAMP '{}'",
+        us_to_ts_lit(start_us),
+        us_to_ts_lit(end_us),
+    ));
+    let where_clause = format!(" WHERE {}", conds.join(" AND "));
+
+    let label_exprs: Vec<String> = group_keys
+        .iter()
+        .map(|k| format!("element_at(s.labels, '{}')[1]", sql_escape(k)))
+        .collect();
+    let mut partition_cols = vec!["sa.timestamp".to_string()];
+    partition_cols.extend(label_exprs.iter().cloned());
+    let partition_clause = format!("PARTITION BY {} ", partition_cols.join(", "));
+    let order_dir = if top { "DESC" } else { "ASC" };
+
+    let sql = format!(
+        "WITH ranked AS ( \
+           SELECT sa.series_id, sa.timestamp, sa.value, \
+                  ROW_NUMBER() OVER ({partition_clause}ORDER BY sa.value {order_dir}) AS rnk \
+           FROM {cat}.skaldberg.samples sa \
+           JOIN {cat}.skaldberg.series s ON sa.series_id = s.series_id \
+           {where_clause} \
+         ) \
+         SELECT s.metric_name, s.labels, rk.timestamp, rk.value \
+         FROM ranked rk \
+         JOIN {cat}.skaldberg.series s ON rk.series_id = s.series_id \
+         WHERE rk.rnk <= {n} \
+         ORDER BY s.metric_name, rk.timestamp",
+        cat = DF_CATALOG_NAME,
+    );
+
+    let df = state
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| PromError::internal(format!("range topk sql: {e}")))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| PromError::internal(format!("range topk collect: {e}")))?;
+
+    let label_filters = label_filters_for_selector(sel);
+    let mut by_series: BTreeMap<String, RangePoints> = BTreeMap::new();
+    for batch in batches {
+        let metric_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+            .ok_or_else(|| PromError::internal("range topk metric_name col"))?;
+        let labels_col = batch.column(1).as_any().downcast_ref::<MapArray>()
+            .ok_or_else(|| PromError::internal("range topk labels col"))?;
+        let ts_col = batch.column(2).as_any().downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or_else(|| PromError::internal("range topk ts col"))?;
+        let val_col = batch.column(3).as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| PromError::internal("range topk value col"))?;
+        for i in 0..batch.num_rows() {
+            let labels = labels_to_btree(labels_col, i)?;
+            if !label_filters.iter().all(|f| match_label(&labels, f)) {
+                continue;
+            }
+            let metric = metric_col.value(i).to_string();
+            let key = series_key(&metric, &labels);
+            let entry = by_series.entry(key).or_insert_with(|| RangePoints {
+                metric_name: metric,
+                labels,
+                points: Vec::new(),
+            });
+            entry.points.push((ts_col.value(i), val_col.value(i)));
+        }
+    }
+    Ok(by_series.into_values().collect())
 }
 
 /// Group input series by retained labels, align by timestamp, then
